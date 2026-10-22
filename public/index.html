@@ -62,6 +62,7 @@ select{width:100%;padding:8px;margin:4px 0 10px;background:var(--bg);color:inher
   <button class="tab" data-t="flow">🧩 المسارات</button>
   <button class="tab" data-t="broadcast">📢 البث</button>
   <button class="tab" data-t="harvest" data-p="broadcast">🎯 المعلّقون</button>
+  <button class="tab" data-t="channels" data-p="settings">🔗 الربط</button>
   <button class="tab" data-t="settings">⚙️ الإعدادات</button>
   <button class="tab" data-t="admins">🔑 المشرفون</button>
   <button class="tab" onclick="logout()">خروج</button>
@@ -94,7 +95,7 @@ function show(){
 const login_=document.getElementById('login');
 document.querySelectorAll('header .tab[data-t]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('header .tab[data-t]').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.t;cur=null;render()});
-function render(){({inbox,comments,users,leads,stats,subs,flow,broadcast,harvest,admins,settings})[tab]()}
+function render(){({inbox,channels,comments,users,leads,stats,subs,flow,broadcast,harvest,admins,settings})[tab]()}
 
 let _cv=[],CQ='';
 function cvHtml(){
@@ -137,6 +138,23 @@ async function leads(){
   <div class="card tbl"><table><tr><th>التاريخ</th><th>القناة</th><th>الاسم</th>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr>
   ${ls.map(l=>`<tr><td>${new Date(l.ts).toLocaleDateString('ar-IQ')}</td><td>${CH[l.channel]}</td><td>${esc(l.name)}</td>${keys.map(k=>`<td>${esc((l.answers||{})[k])}</td>`).join('')}</tr>`).join('')}</table></div>`;
 }
+addEventListener('message',e=>{if(e.origin===location.origin&&e.data==='fb-done'&&tab==='channels')channels()});
+async function channels(){
+  const s=await api('/api/fb/status'),cp=t=>`<input readonly dir="ltr" value="${esc(t)}" onclick="this.select()">`;
+  main.innerHTML=`<div class="card"><div style="display:flex;gap:10px;align-items:center"><span class="badge fb">فيسبوك</span><b style="flex:1">${s.connected?esc(s.name||'مربوط (عبر متغيرات Render)'):'غير مربوط'}</b>${s.connected?'<span>✅</span>':''}</div>
+  ${s.igName?`<div class="mu" style="margin-top:6px"><span class="badge ig">انستغرام</span> @${esc(s.igName)}</div>`:''}
+  ${s.appReady?`<div style="margin-top:12px"><button class="btn" onclick="fbConnect()">${s.connected?'🔄 إعادة الربط / تغيير الصفحة':'🔗 ربط صفحة فيسبوك'}</button> ${s.source=='db'?'<button class="tab" onclick="fbOff()">فصل</button>':''}</div>
+  <p class="mu">ستفتح نافذة فيسبوك: سجّل الدخول ووافق على الصلاحيات واختر صفحتك. بعدها يفعّل النظام استقبال الرسائل والتعليقات تلقائياً.</p>`
+  :`<p class="mu" style="margin-top:10px">لتفعيل زر الربط أضف في Render ← Environment المتغيرين <b>FB_APP_ID</b> و <b>FB_APP_SECRET</b> (من Meta ← App settings ← Basic) ثم أعد النشر.</p>`}</div>
+  ${s.pending.length?`<div class="card"><b>اختر الصفحة التي تريد ربطها</b>${s.pending.map((p,i)=>`<div class="conv" style="margin-top:8px"><div style="flex:1"><b>${esc(p.name)}</b>${p.igName?`<div class="mu">انستغرام: @${esc(p.igName)}</div>`:''}</div><button class="btn" onclick="fbPick('${esc(p.id)}')">اختيار</button></div>`).join('')}</div>`:''}
+  <div class="card"><b>إعدادات تضعها في Meta (مرة واحدة)</b>
+  <label>Valid OAuth Redirect URI (Facebook Login ← Settings)</label>${cp(s.redirect)}
+  <label>Webhook Callback URL</label>${cp(s.webhook)}
+  <p class="mu">واتساب يُربط من متغيري WA_TOKEN و WA_PHONE_ID في Render.</p></div>`;
+}
+function fbConnect(){const w=open('/auth/facebook?t='+encodeURIComponent(T),'fbc','width=620,height=720');if(!w)location.href='/auth/facebook?t='+encodeURIComponent(T)}
+async function fbPick(id){const r=await api('/api/fb/select',{method:'POST',body:JSON.stringify({id})});if(r.error)return alert(r.error);alert('تم الربط ✅');channels()}
+async function fbOff(){if(confirm('فصل الصفحة؟ سيتوقف الرد التلقائي'))await api('/api/fb/disconnect',{method:'POST'}),channels()}
 let CM={ch:'fb'},_cm=[];
 const cmRows=()=>_cm.length?_cm.map((c,i)=>`<div class="card"><div style="display:flex;gap:8px;align-items:center"><span class="badge ${esc(c.channel)}">${CH[c.channel]||''}</span><b style="flex:1">${esc(c.name||c.user_id)}</b><span class="mu">${new Date(c.ts).toLocaleString('ar-IQ',{hour:'2-digit',minute:'2-digit',day:'numeric',month:'numeric'})}</span></div>
   <p style="margin:8px 0;white-space:pre-wrap">${esc(c.text)}</p>

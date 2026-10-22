@@ -18,8 +18,9 @@ npm start
 | ADMIN_PASSWORD | كلمة مرور المدير الأساسي (المستخدم: admin) |
 | SECRET | نص عشوائي لتوقيع الجلسات |
 | VERIFY_TOKEN | نفس القيمة في إعداد Meta Webhook |
-| FB_PAGE_TOKEN | Page Access Token (فيسبوك + انستغرام) |
-| IG_USER_ID | معرّف حساب انستغرام Business |
+| FB_APP_ID / FB_APP_SECRET | من Meta ← App settings ← Basic (لزر «ربط» في تبويب 🔗 الربط) |
+| FB_PAGE_TOKEN / IG_USER_ID | اختياريان: بديل يدوي عن زر الربط |
+| BASE_URL | اختياري: رابط الموقع إن لم يُكتشف تلقائياً |
 | WA_TOKEN | WhatsApp Cloud API token |
 | WA_PHONE_ID | معرّف رقم واتساب |
 

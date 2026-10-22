@@ -6,6 +6,7 @@ const ExcelJS = require('exceljs');
 
 const E = process.env;
 const G = 'https://graph.facebook.com/v21.0';
+const FB = { token: E.FB_PAGE_TOKEN, ig: E.IG_USER_ID, pageId: '', name: '', igName: '', source: E.FB_PAGE_TOKEN ? 'env' : 'none' };
 const pool = new Pool({ connectionString: E.DATABASE_URL, ssl: E.DATABASE_URL && !E.DATABASE_URL.includes('localhost') ? { rejectUnauthorized: false } : false });
 const q = (sql, p) => pool.query(sql, p).then(r => r.rows);
 const app = express();
@@ -33,6 +34,8 @@ async function init() {
   await q(`CREATE TABLE IF NOT EXISTS messages(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, dir TEXT, text TEXT, ts TIMESTAMPTZ DEFAULT now())`);
   await q(`CREATE TABLE IF NOT EXISTS bot_sessions(channel TEXT, contact TEXT, name TEXT, node TEXT, data JSONB DEFAULT '{}', paused BOOLEAN DEFAULT false, PRIMARY KEY(channel, contact))`);
   await q(`CREATE TABLE IF NOT EXISTS leads(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, answers JSONB, ts TIMESTAMPTZ DEFAULT now())`);
+  const sv = (await q(`SELECT v FROM settings WHERE k='fb'`))[0];
+  if (sv) Object.assign(FB, sv.v, { source: 'db' });
 }
 const getSettings = async () => {
   const r = await q(`SELECT v FROM settings WHERE k='main'`);
@@ -55,9 +58,9 @@ async function log(channel, contact, name, dir, text) {
 // send a DM. opts.commentId => private reply to a comment
 async function send(channel, to, text, name, opts = {}) {
   if (channel === 'fb') {
-    await api(`${G}/me/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, messaging_type: 'RESPONSE', message: { text } }, E.FB_PAGE_TOKEN);
+    await api(`${G}/me/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, messaging_type: 'RESPONSE', message: { text } }, FB.token);
   } else if (channel === 'ig') {
-    await api(`${G}/${E.IG_USER_ID}/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, message: { text } }, E.FB_PAGE_TOKEN);
+    await api(`${G}/${FB.ig}/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, message: { text } }, FB.token);
   } else if (channel === 'wa') {
     await api(`${G}/${E.WA_PHONE_ID}/messages`, { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }, E.WA_TOKEN);
   }
@@ -88,9 +91,9 @@ const setSes = (ch, c, name, node, data, paused) => q(
 
 async function raw(ch, to, message, opts = {}) {
   const recipient = opts.commentId ? { comment_id: opts.commentId } : { id: to };
-  const url = ch === 'fb' ? `${G}/me/messages` : `${G}/${E.IG_USER_ID}/messages`;
+  const url = ch === 'fb' ? `${G}/me/messages` : `${G}/${FB.ig}/messages`;
   const body = ch === 'fb' ? { recipient, messaging_type: 'RESPONSE', message } : { recipient, message };
-  const r = await api(url, body, E.FB_PAGE_TOKEN);
+  const r = await api(url, body, FB.token);
   if (opts.t && r.__ok === false) opts.t.fail = true;
   return r;
 }
@@ -169,9 +172,9 @@ async function handleComment(ch, commentId, userId, name, text, postId) {
   await log(ch, userId, name, 'in', `💬 تعليق: ${text}`);
   let liked = false, replied = false, dm = false;
   if (ch === 'fb') {
-    if (s.autoLike) liked = !!(await api(`${G}/${commentId}/likes`, {}, E.FB_PAGE_TOKEN)).__ok;
-    if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/comments`, { message: s.commentReply }, E.FB_PAGE_TOKEN)).__ok;
-  } else if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/replies`, { message: s.commentReply }, E.FB_PAGE_TOKEN)).__ok;
+    if (s.autoLike) liked = !!(await api(`${G}/${commentId}/likes`, {}, FB.token)).__ok;
+    if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/comments`, { message: s.commentReply }, FB.token)).__ok;
+  } else if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/replies`, { message: s.commentReply }, FB.token)).__ok;
   if (s.autoPrivateReply) { const f = await getFlow(); await setSes(ch, userId, name, null, {}, false); const t = {}; await goNode(ch, userId, name, f.start, { commentId, t }); dm = !t.fail; }
   await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,liked,replied,dm) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
            ON CONFLICT(channel,comment_id) DO UPDATE SET liked=comments.liked OR $7, replied=comments.replied OR $8, dm=comments.dm OR $9`,
@@ -438,14 +441,14 @@ const getComment = async id => (await q(`SELECT * FROM comments WHERE id=$1`, [i
 app.post('/api/comments/:id/like', auth, can('inbox'), wrap(async (req, res) => {
   const c = await getComment(req.params.id); if (!c) return res.status(404).json({ error: 'غير موجود' });
   if (c.channel !== 'fb') return res.status(400).json({ error: 'الإعجاب بالتعليق متاح لفيسبوك فقط' });
-  const r = await api(`${G}/${c.comment_id}/likes`, {}, E.FB_PAGE_TOKEN);
+  const r = await api(`${G}/${c.comment_id}/likes`, {}, FB.token);
   if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الإعجاب' });
   await q(`UPDATE comments SET liked=true WHERE id=$1`, [c.id]); res.json({ ok: true });
 }));
 app.post('/api/comments/:id/reply', auth, can('inbox'), wrap(async (req, res) => {
   const c = await getComment(req.params.id), text = String(req.body.text || '').trim();
   if (!c || !text) return res.status(400).json({ error: 'نص الرد مطلوب' });
-  const r = await api(c.channel === 'fb' ? `${G}/${c.comment_id}/comments` : `${G}/${c.comment_id}/replies`, { message: text }, E.FB_PAGE_TOKEN);
+  const r = await api(c.channel === 'fb' ? `${G}/${c.comment_id}/comments` : `${G}/${c.comment_id}/replies`, { message: text }, FB.token);
   if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الرد' });
   await q(`UPDATE comments SET replied=true WHERE id=$1`, [c.id]); res.json({ ok: true });
 }));
@@ -459,11 +462,11 @@ app.post('/api/comments/:id/dm', auth, can('inbox'), wrap(async (req, res) => {
 // pull latest comments of recent posts (for comments that arrived while the server was asleep)
 app.post('/api/comments/sync', auth, can('inbox'), wrap(async (req, res) => {
   const ig = req.body.channel === 'ig', ch = ig ? 'ig' : 'fb';
-  const me = ig ? E.IG_USER_ID : (await gget(`${G}/me?fields=id`, E.FB_PAGE_TOKEN)).id;
-  const posts = (await gget(ig ? `${G}/${E.IG_USER_ID}/media?fields=id&limit=10` : `${G}/me/posts?fields=id&limit=10`, E.FB_PAGE_TOKEN)).data || [];
+  const me = ig ? FB.ig : (await gget(`${G}/me?fields=id`, FB.token)).id;
+  const posts = (await gget(ig ? `${G}/${FB.ig}/media?fields=id&limit=10` : `${G}/me/posts?fields=id&limit=10`, FB.token)).data || [];
   let n = 0;
   for (const p of posts) {
-    const j = await gget(ig ? `${G}/${p.id}/comments?fields=id,text,username,from,timestamp&limit=50` : `${G}/${p.id}/comments?fields=id,message,from{id,name},created_time&limit=50`, E.FB_PAGE_TOKEN);
+    const j = await gget(ig ? `${G}/${p.id}/comments?fields=id,text,username,from,timestamp&limit=50` : `${G}/${p.id}/comments?fields=id,message,from{id,name},created_time&limit=50`, FB.token);
     for (const c of j.data || []) {
       const uid = c.from && c.from.id; if (!uid || uid === me) continue;
       const r = await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,ts) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel,comment_id) DO NOTHING RETURNING id`,
@@ -472,6 +475,54 @@ app.post('/api/comments/sync', auth, can('inbox'), wrap(async (req, res) => {
     }
   }
   res.json({ added: n });
+}));
+
+// ---------- Connect Facebook (OAuth: one click, no manual tokens) ----------
+const origin = req => (E.BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+const SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata,pages_manage_engagement,pages_read_engagement,instagram_basic,instagram_manage_messages,instagram_manage_comments';
+const getJson = async url => { const r = await fetch(url); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error((j.error && j.error.message) || 'Facebook error'); return j; };
+app.get('/auth/facebook', auth, can('settings'), (req, res) => {
+  if (!E.FB_APP_ID || !E.FB_APP_SECRET) return res.status(400).send('أضف FB_APP_ID و FB_APP_SECRET في متغيرات Render أولاً');
+  const state = mkToken(req.user.u, 'fb');
+  res.redirect(`https://www.facebook.com/v21.0/dialog/oauth?client_id=${E.FB_APP_ID}&redirect_uri=${encodeURIComponent(origin(req) + '/auth/facebook/callback')}&state=${state}&scope=${SCOPES}`);
+});
+const done = (res, ok, msg) => res.send(`<!doctype html><meta charset=utf-8><body style="font-family:sans-serif;text-align:center;padding:40px" dir=rtl><h3>${ok ? '✅ تم' : '❌ فشل'}</h3><p>${String(msg).replace(/[<>&]/g, '')}</p><script>try{opener.postMessage('fb-done',location.origin)}catch(e){}${ok ? 'setTimeout(()=>close(),1200)' : ''}</script>`);
+app.get('/auth/facebook/callback', wrap(async (req, res) => {
+  const st = readToken(req.query.state);
+  if (!st || st.r !== 'fb') return done(res, false, 'جلسة غير صالحة، أعد المحاولة');
+  if (req.query.error || !req.query.code) return done(res, false, 'تم إلغاء الربط');
+  try {
+    const redirect = encodeURIComponent(origin(req) + '/auth/facebook/callback');
+    const t1 = await getJson(`${G}/oauth/access_token?client_id=${E.FB_APP_ID}&client_secret=${E.FB_APP_SECRET}&redirect_uri=${redirect}&code=${encodeURIComponent(req.query.code)}`);
+    const t2 = await getJson(`${G}/oauth/access_token?grant_type=fb_exchange_token&client_id=${E.FB_APP_ID}&client_secret=${E.FB_APP_SECRET}&fb_exchange_token=${t1.access_token}`);
+    const pg = await getJson(`${G}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&limit=100&access_token=${t2.access_token}`);
+    const pages = (pg.data || []).map(p => ({ id: p.id, name: p.name, token: p.access_token, ig: p.instagram_business_account && p.instagram_business_account.id || '', igName: p.instagram_business_account && p.instagram_business_account.username || '' }));
+    if (!pages.length) return done(res, false, 'لم تُمنح صلاحية أي صفحة. أعد الربط واختر صفحتك');
+    await q(`INSERT INTO settings(k,v) VALUES('fb_pending',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify(pages)]);
+    done(res, true, 'ارجع للوحة واختر الصفحة');
+  } catch (e) { console.error(e); done(res, false, e.message); }
+}));
+app.get('/api/fb/status', auth, can('settings'), wrap(async (req, res) => {
+  const pend = (await q(`SELECT v FROM settings WHERE k='fb_pending'`))[0];
+  res.json({ appReady: !!(E.FB_APP_ID && E.FB_APP_SECRET), connected: !!FB.token, source: FB.source, pageId: FB.pageId, name: FB.name, ig: FB.ig, igName: FB.igName,
+    pending: pend ? pend.v.map(p => ({ id: p.id, name: p.name, igName: p.igName })) : [], redirect: origin(req) + '/auth/facebook/callback', webhook: origin(req) + '/webhook' });
+}));
+app.post('/api/fb/select', auth, can('settings'), wrap(async (req, res) => {
+  const pend = (await q(`SELECT v FROM settings WHERE k='fb_pending'`))[0], p = pend && pend.v.find(x => x.id === req.body.id);
+  if (!p) return res.status(400).json({ error: 'أعد الربط من جديد' });
+  const sub = await api(`${G}/${p.id}/subscribed_apps`, { subscribed_fields: ['messages', 'messaging_postbacks', 'feed'] }, p.token);
+  if (!sub.__ok) return res.status(400).json({ error: (sub.error && sub.error.message) || 'تعذر تفعيل استقبال الرسائل والتعليقات' });
+  const v = { token: p.token, ig: p.ig, pageId: p.id, name: p.name, igName: p.igName };
+  await q(`INSERT INTO settings(k,v) VALUES('fb',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify(v)]);
+  await q(`DELETE FROM settings WHERE k='fb_pending'`);
+  Object.assign(FB, v, { source: 'db' });
+  res.json({ ok: true });
+}));
+app.post('/api/fb/disconnect', auth, can('settings'), wrap(async (req, res) => {
+  if (FB.pageId) await fetch(`${G}/${FB.pageId}/subscribed_apps?access_token=${FB.token}`, { method: 'DELETE' }).catch(() => {});
+  await q(`DELETE FROM settings WHERE k IN ('fb','fb_pending')`);
+  Object.assign(FB, { token: E.FB_PAGE_TOKEN, ig: E.IG_USER_ID, pageId: '', name: '', igName: '', source: E.FB_PAGE_TOKEN ? 'env' : 'none' });
+  res.json({ ok: true });
 }));
 
 // ---------- Post commenters (official API, own page/account only) ----------
@@ -483,14 +534,14 @@ const gget = async (url, token) => {
 };
 app.get('/api/posts', auth, can('broadcast'), wrap(async (req, res) => {
   const ig = req.query.channel === 'ig';
-  const j = await gget(ig ? `${G}/${E.IG_USER_ID}/media?fields=id,caption,timestamp&limit=20` : `${G}/me/posts?fields=id,message,created_time&limit=20`, E.FB_PAGE_TOKEN);
+  const j = await gget(ig ? `${G}/${FB.ig}/media?fields=id,caption,timestamp&limit=20` : `${G}/me/posts?fields=id,message,created_time&limit=20`, FB.token);
   res.json((j.data || []).map(p => ({ id: p.id, text: (p.message || p.caption || '').slice(0, 80), ts: p.created_time || p.timestamp })));
 }));
 app.post('/api/harvest', auth, can('broadcast'), wrap(async (req, res) => {
   const { channel, postId } = req.body, ig = channel === 'ig';
   let url = ig ? `${G}/${postId}/comments?fields=id,text,username,from,timestamp&limit=100` : `${G}/${postId}/comments?fields=id,message,from{id,name},created_time&limit=100`, n = 0;
   for (let i = 0; i < 50 && url; i++) {
-    const j = await gget(url, E.FB_PAGE_TOKEN);
+    const j = await gget(url, FB.token);
     for (const c of j.data || []) {
       const uid = c.from && c.from.id; if (!uid) continue;
       const name = ig ? (c.username || c.from.username || '') : c.from.name;
