@@ -54,6 +54,7 @@ select{width:100%;padding:8px;margin:4px 0 10px;background:var(--bg);color:inher
 <div id="app" style="display:none">
 <header>
   <button class="tab on" data-t="inbox">📥 الصندوق</button>
+  <button class="tab" data-t="comments" data-p="inbox">💬 التعليقات</button>
   <button class="tab" data-t="users">👥 المستخدمون</button>
   <button class="tab" data-t="leads">📋 العملاء</button>
   <button class="tab" data-t="stats">📊 الإحصائيات</button>
@@ -93,7 +94,7 @@ function show(){
 const login_=document.getElementById('login');
 document.querySelectorAll('header .tab[data-t]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('header .tab[data-t]').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.t;cur=null;render()});
-function render(){({inbox,users,leads,stats,subs,flow,broadcast,harvest,admins,settings})[tab]()}
+function render(){({inbox,comments,users,leads,stats,subs,flow,broadcast,harvest,admins,settings})[tab]()}
 
 let _cv=[],CQ='';
 function cvHtml(){
@@ -135,6 +136,24 @@ async function leads(){
   main.innerHTML=`<div class="card"><a class="btn" style="text-decoration:none;display:inline-block" href="/api/export.xlsx?t=${T}">⬇️ تحميل Excel</a></div>
   <div class="card tbl"><table><tr><th>التاريخ</th><th>القناة</th><th>الاسم</th>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr>
   ${ls.map(l=>`<tr><td>${new Date(l.ts).toLocaleDateString('ar-IQ')}</td><td>${CH[l.channel]}</td><td>${esc(l.name)}</td>${keys.map(k=>`<td>${esc((l.answers||{})[k])}</td>`).join('')}</tr>`).join('')}</table></div>`;
+}
+let CM={ch:'fb'},_cm=[];
+const cmRows=()=>_cm.length?_cm.map((c,i)=>`<div class="card"><div style="display:flex;gap:8px;align-items:center"><span class="badge ${esc(c.channel)}">${CH[c.channel]||''}</span><b style="flex:1">${esc(c.name||c.user_id)}</b><span class="mu">${new Date(c.ts).toLocaleString('ar-IQ',{hour:'2-digit',minute:'2-digit',day:'numeric',month:'numeric'})}</span></div>
+  <p style="margin:8px 0;white-space:pre-wrap">${esc(c.text)}</p>
+  <div class="mu" style="margin-bottom:6px">${c.liked?'❤️ أُعجب ':''}${c.replied?'↩️ رُدّ علناً ':''}${c.dm?'✉️ رسالة خاصة':''}</div>
+  <input id="cr${i}" placeholder="اكتب ردك..." style="margin-bottom:6px">
+  <div style="display:flex;gap:6px;flex-wrap:wrap">${c.channel=='fb'?`<button class="tab" onclick="cmAct(${i},'like')">❤️ إعجاب</button>`:''}<button class="btn" onclick="cmAct(${i},'reply')">↩️ رد علني</button><button class="tab" onclick="cmAct(${i},'dm')">✉️ رسالة خاصة</button></div></div>`).join(''):'<p class="mu">لا توجد تعليقات بعد. اضغط «تحديث من الصفحة» أو انتظر وصول تعليقات جديدة.</p>';
+async function comments(){
+  _cm=await api('/api/comments?channel='+CM.ch);
+  main.innerHTML=`<div class="card"><select onchange="CM.ch=this.value;comments()"><option value="fb" ${CM.ch=='fb'?'selected':''}>فيسبوك</option><option value="ig" ${CM.ch=='ig'?'selected':''}>انستغرام</option></select>
+  <button class="tab" onclick="cmSync()">🔄 تحديث من الصفحة</button><div class="mu">الرد والإعجاب يظهران باسم صفحتك.</div></div><div id="cml">${cmRows()}</div>`;
+}
+async function cmSync(){const r=await api('/api/comments/sync',{method:'POST',body:JSON.stringify({channel:CM.ch})});if(r.error)return alert(r.error);alert('أُضيف '+r.added+' تعليق');comments()}
+async function cmAct(i,a){
+  const c=_cm[i],body=a=='like'?{}:{text:document.getElementById('cr'+i).value.trim()};
+  if(a!='like'&&!body.text)return alert('اكتب النص أولاً');
+  const r=await api(`/api/comments/${c.id}/${a}`,{method:'POST',body:JSON.stringify(body)});
+  if(r.error)return alert(r.error);comments();
 }
 let F=null,U={page:1,search:'',ch:''};
 const MT=[['is','الرسالة تساوي'],['contains','تحتوي'],['word','تحتوي كلمة'],['starts','تبدأ بـ'],['resume','كلمة استئناف البوت'],['image','صورة'],['sticker','ملصق'],['audio','صوت']];
@@ -295,10 +314,11 @@ async function saveS(){
   await api('/api/settings',{method:'PUT',body:JSON.stringify({commentReply:cr.value,notifyWhatsApp:nw.value.trim(),autoLike:al.checked,autoPublicReply:ap.checked,autoPrivateReply:av.checked})});
   alert('تم الحفظ ✅');
 }
-setInterval(()=>{
+setInterval(async()=>{
   if(!T||document.hidden)return;
   const typing=document.activeElement&&document.activeElement.matches('input,textarea,select');
   if(tab==='inbox'){cur?refreshChat():(!typing&&inbox())}
+  else if(tab==='comments'&&!typing){_cm=await api('/api/comments?channel='+CM.ch);const e=document.getElementById('cml');if(e)e.innerHTML=cmRows()}
   else if(tab==='broadcast')refreshB();
 },8000);
 show();

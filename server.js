@@ -22,6 +22,7 @@ const DEFAULTS = {
 
 async function init() {
   await q(`CREATE TABLE IF NOT EXISTS harvest(id SERIAL PRIMARY KEY, channel TEXT, post_id TEXT, comment_id TEXT, user_id TEXT, name TEXT, text TEXT, commented_at TIMESTAMPTZ, sent BOOLEAN DEFAULT false, UNIQUE(channel, comment_id))`);
+  await q(`CREATE TABLE IF NOT EXISTS comments(id SERIAL PRIMARY KEY, channel TEXT, comment_id TEXT, post_id TEXT, user_id TEXT, name TEXT, text TEXT, ts TIMESTAMPTZ DEFAULT now(), liked BOOLEAN DEFAULT false, replied BOOLEAN DEFAULT false, dm BOOLEAN DEFAULT false, UNIQUE(channel, comment_id))`);
   await q(`CREATE TABLE IF NOT EXISTS plans(id SERIAL PRIMARY KEY, name TEXT, price NUMERIC DEFAULT 0, days INT DEFAULT 30)`);
   await q(`CREATE TABLE IF NOT EXISTS subs(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, plan_id INT, plan_name TEXT, price NUMERIC DEFAULT 0, start_at TIMESTAMPTZ, end_at TIMESTAMPTZ, status TEXT DEFAULT 'active', ts TIMESTAMPTZ DEFAULT now())`);
   await q(`CREATE TABLE IF NOT EXISTS bot_users(channel TEXT, contact TEXT, name TEXT, phone TEXT, last_seen TIMESTAMPTZ, created TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(channel, contact))`);
@@ -163,14 +164,18 @@ async function handleIncoming(ch, c, name, text, payload, type = 'text') {
   if (kw) return goNode(ch, c, name, kw.node || flow.start);
   if (type === 'text') return goNode(ch, c, name, flow.fallback || flow.start);
 }
-async function handleComment(ch, commentId, userId, name, text) {
+async function handleComment(ch, commentId, userId, name, text, postId) {
   const s = await getSettings();
   await log(ch, userId, name, 'in', `💬 تعليق: ${text}`);
+  let liked = false, replied = false, dm = false;
   if (ch === 'fb') {
-    if (s.autoLike) await api(`${G}/${commentId}/likes`, {}, E.FB_PAGE_TOKEN);
-    if (s.autoPublicReply) await api(`${G}/${commentId}/comments`, { message: s.commentReply }, E.FB_PAGE_TOKEN);
-  } else if (s.autoPublicReply) await api(`${G}/${commentId}/replies`, { message: s.commentReply }, E.FB_PAGE_TOKEN);
-  if (s.autoPrivateReply) { const f = await getFlow(); await setSes(ch, userId, name, null, {}, false); await goNode(ch, userId, name, f.start, { commentId }); }
+    if (s.autoLike) liked = !!(await api(`${G}/${commentId}/likes`, {}, E.FB_PAGE_TOKEN)).__ok;
+    if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/comments`, { message: s.commentReply }, E.FB_PAGE_TOKEN)).__ok;
+  } else if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/replies`, { message: s.commentReply }, E.FB_PAGE_TOKEN)).__ok;
+  if (s.autoPrivateReply) { const f = await getFlow(); await setSes(ch, userId, name, null, {}, false); const t = {}; await goNode(ch, userId, name, f.start, { commentId, t }); dm = !t.fail; }
+  await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,liked,replied,dm) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           ON CONFLICT(channel,comment_id) DO UPDATE SET liked=comments.liked OR $7, replied=comments.replied OR $8, dm=comments.dm OR $9`,
+    [ch, commentId, postId || '', userId, name || '', (text || '').slice(0, 1000), liked, replied, dm]);
 }
 async function sendManual(ch, to, text) { await sendNode(ch, to, { text }, ''); await setSes(ch, to, '', null, (await getSes(ch, to)).data, true); }
 
@@ -197,9 +202,9 @@ app.post('/webhook', (req, res) => {
         for (const c of en.changes || []) {
           const v = c.value || {};
           if (ch === 'fb' && c.field === 'feed' && v.item === 'comment' && v.verb === 'add' && v.from && v.from.id !== en.id)
-            await handleComment('fb', v.comment_id, v.from.id, v.from.name, v.message || '');
+            await handleComment('fb', v.comment_id, v.from.id, v.from.name, v.message || '', v.post_id);
           if (ch === 'ig' && c.field === 'comments' && v.from && v.from.id !== en.id)
-            await handleComment('ig', v.id, v.from.id, v.from.username, v.text || '');
+            await handleComment('ig', v.id, v.from.id, v.from.username, v.text || '', v.media && v.media.id);
         }
       } else if (b.object === 'whatsapp_business_account') {
         for (const c of en.changes || []) {
@@ -423,6 +428,51 @@ app.post('/api/subs', auth, can('subs'), wrap(async (req, res) => {
   res.json({ ok: true, end });
 }));
 app.post('/api/subs/:id/cancel', auth, can('subs'), wrap(async (req, res) => { await q(`UPDATE subs SET status='cancelled' WHERE id=$1`, [req.params.id]); res.json({ ok: true }); }));
+
+// ---------- Comments panel (reply / like as the page) ----------
+app.get('/api/comments', auth, can('inbox'), wrap(async (req, res) => {
+  const ch = ['fb', 'ig'].includes(req.query.channel) ? req.query.channel : '';
+  res.json(await q(`SELECT id,channel,post_id,user_id,name,text,ts,liked,replied,dm FROM comments WHERE ($1='' OR channel=$1) ORDER BY ts DESC LIMIT 100`, [ch]));
+}));
+const getComment = async id => (await q(`SELECT * FROM comments WHERE id=$1`, [id]))[0];
+app.post('/api/comments/:id/like', auth, can('inbox'), wrap(async (req, res) => {
+  const c = await getComment(req.params.id); if (!c) return res.status(404).json({ error: 'غير موجود' });
+  if (c.channel !== 'fb') return res.status(400).json({ error: 'الإعجاب بالتعليق متاح لفيسبوك فقط' });
+  const r = await api(`${G}/${c.comment_id}/likes`, {}, E.FB_PAGE_TOKEN);
+  if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الإعجاب' });
+  await q(`UPDATE comments SET liked=true WHERE id=$1`, [c.id]); res.json({ ok: true });
+}));
+app.post('/api/comments/:id/reply', auth, can('inbox'), wrap(async (req, res) => {
+  const c = await getComment(req.params.id), text = String(req.body.text || '').trim();
+  if (!c || !text) return res.status(400).json({ error: 'نص الرد مطلوب' });
+  const r = await api(c.channel === 'fb' ? `${G}/${c.comment_id}/comments` : `${G}/${c.comment_id}/replies`, { message: text }, E.FB_PAGE_TOKEN);
+  if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الرد' });
+  await q(`UPDATE comments SET replied=true WHERE id=$1`, [c.id]); res.json({ ok: true });
+}));
+app.post('/api/comments/:id/dm', auth, can('inbox'), wrap(async (req, res) => {
+  const c = await getComment(req.params.id), text = String(req.body.text || '').trim();
+  if (!c || !text) return res.status(400).json({ error: 'نص الرسالة مطلوب' });
+  const t = {}; await sendNode(c.channel, c.user_id, { text }, c.name, { commentId: c.comment_id, t });
+  if (t.fail) return res.status(400).json({ error: 'تعذر إرسال الرسالة (التعليق أقدم من 7 أيام أو سبق الرد عليه خاصاً)' });
+  await q(`UPDATE comments SET dm=true WHERE id=$1`, [c.id]); res.json({ ok: true });
+}));
+// pull latest comments of recent posts (for comments that arrived while the server was asleep)
+app.post('/api/comments/sync', auth, can('inbox'), wrap(async (req, res) => {
+  const ig = req.body.channel === 'ig', ch = ig ? 'ig' : 'fb';
+  const me = ig ? E.IG_USER_ID : (await gget(`${G}/me?fields=id`, E.FB_PAGE_TOKEN)).id;
+  const posts = (await gget(ig ? `${G}/${E.IG_USER_ID}/media?fields=id&limit=10` : `${G}/me/posts?fields=id&limit=10`, E.FB_PAGE_TOKEN)).data || [];
+  let n = 0;
+  for (const p of posts) {
+    const j = await gget(ig ? `${G}/${p.id}/comments?fields=id,text,username,from,timestamp&limit=50` : `${G}/${p.id}/comments?fields=id,message,from{id,name},created_time&limit=50`, E.FB_PAGE_TOKEN);
+    for (const c of j.data || []) {
+      const uid = c.from && c.from.id; if (!uid || uid === me) continue;
+      const r = await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,ts) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel,comment_id) DO NOTHING RETURNING id`,
+        [ch, c.id, p.id, uid, ig ? (c.username || '') : c.from.name, (c.message || c.text || '').slice(0, 1000), c.created_time || c.timestamp]);
+      n += r.length;
+    }
+  }
+  res.json({ added: n });
+}));
 
 // ---------- Post commenters (official API, own page/account only) ----------
 const gget = async (url, token) => {
