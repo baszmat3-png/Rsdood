@@ -1,0 +1,131 @@
+# This file contains expected words in sender's message. Bot will reply to messages containing any line in this file as any line in the reply.txt file. For a message containing the 1st line, bot will reply the 1st line of the reply.txt file. Edit as you like. Place the words according to the possibility of getting from senders. You can also update this file when the code is already running. Just be sure to update the file from the last line, not in the middle nor from the start. Also, don't keep the last line empty when you edit this file every time. You don't need to use capital letters for message examples though this file contains capital and small letters. Just use small letters. Delete this line after reading. Don't keep this line empty.
+how are you
+How are you
+How Are You
+h r u
+H r u
+how r u
+How r u
+kemon acho
+kmn
+aco
+kmn aco
+কেমন আছো
+কেমন আছ
+কেমন আছস
+কেমন আসস
+kemon aco
+kemun aso
+kemon aso
+ki khobor
+Ki khobor
+khobor
+কি খবর
+খবর
+খবর কি
+কি অবস্থা
+ki obostha
+ki obosta
+কি অবস্তা
+আসসালামু আলাইকুম
+আসসালামু
+আলাইকুম
+assalamu alaikum
+Assalamu Alaikum
+assalamu
+Assalamu
+alaikum
+Alaikum
+hi
+hello
+Hi
+Hello
+hlw
+Hlw
+hllw
+hey
+kio
+ki koro
+ki kro
+কি কর
+কি করো
+কি করস
+কি করছ
+কি করসো
+কি করছো
+ok
+okay
+okke
+omg
+Omg
+OMG
+congra
+Congra
+thank
+tnx
+welcome
+wlcm
+good bye
+গুড বাই
+বাই
+bye
+good night
+gd night
+gd ni8
+gd n8
+গুড নাইট
+গুড
+gd
+khaiso
+khaisos
+খাইসো
+খাইসোস
+খাইসস
+খাইছস
+dinner korso
+dinner korsos
+ডিনার করসো
+ডিনার করস
+ডিনার করছ
+ডিনার করছো
+👍
+👎
+👌
+👏
+🖕
+💪
+👊
+🐸
+☺
+😁
+😂
+😉
+😏
+😒
+😍
+😘
+😲
+😵
+😳
+😰
+😑
+😐
+😧
+😮
+😦
+😱
+😨
+😯
+valo acho
+valo aso
+balo aso
+balo acho
+ভালো আছো
+ভালো আছ
+ভাল আছ
+বালো আছো
+বালো আছ
+বাল আছ
+asos
+acho
+achos
