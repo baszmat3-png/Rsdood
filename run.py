@@ -1,155 +1,128 @@
 from fbchat import Client
 from fbchat.models import *
 from random import randrange
+import os
 import time
 from datetime import datetime
-import sys
 import string
-from pygtail import Pygtail
 import pickle
 from getpass import getpass
 
+auto = '[Auto Reply by bot! 🤖 ]\n'
 
-prev_threads = []
-bloc_threads = []
-
-prebloc_threads = []
-
-received = []
-reply = []
-
-auto = '[Auto Reply by bot! 🤖 ] \n '
+prev_threads = []    # people who already got the primary message
+bloc_threads = []    # people who already got the secondary message (bot stays quiet for them)
 
 
+def read_lines(path):
+    """All lines of a file, kept 1:1 with line numbers (received.txt <-> reply.txt)."""
+    with open(path, encoding='utf8') as f:
+        return [line.rstrip('\n').strip() for line in f]
 
 
-with open('msg1.txt', encoding='utf8') as my_file1:
-	txt1 = my_file1.read().strip()
-
-with open('msg2.txt', encoding='utf8') as my_file2:
-	txt2 = my_file2.read().strip()
-
-with open('blacklist.txt', encoding='utf8') as my_file3:
-	for line in my_file3:
-		prebloc_threads.append(line.strip())
-
-with open('received.txt', encoding='utf8') as my_file4:
-	for line in my_file4:
-		received.append(line.strip())
-
-with open('reply.txt', encoding='utf8') as my_file5:
-	for line in my_file5:
-		reply.append(line.strip())
+def read_text(path):
+    """Whole file as text, without the '#' instruction lines."""
+    with open(path, encoding='utf8') as f:
+        return '\n'.join(l for l in f.read().splitlines() if not l.lstrip().startswith('#')).strip()
 
 
+class Data:
+    """Reloads the .txt files automatically whenever they are edited while the bot runs."""
+    FILES = ('received.txt', 'reply.txt', 'blacklist.txt', 'msg1.txt', 'msg2.txt')
+
+    def __init__(self):
+        self.stamp = None
+        self.reload()
+
+    def reload(self):
+        stamp = tuple(os.path.getmtime(f) for f in self.FILES)
+        if stamp == self.stamp:
+            return
+        self.stamp = stamp
+        self.received = read_lines('received.txt')
+        self.reply = read_lines('reply.txt')
+        self.blacklist = {l for l in read_lines('blacklist.txt') if l and not l.startswith('#')}
+        self.txt1 = read_text('msg1.txt')
+        self.txt2 = read_text('msg2.txt')
+        if len(self.received) != len(self.reply):
+            print('WARNING: received.txt has %d lines but reply.txt has %d. '
+                  'Each received line must have its reply on the same line number.'
+                  % (len(self.received), len(self.reply)))
+
+    def find_reply(self, matching):
+        """Reply for the first line of received.txt that appears inside the message."""
+        for i, word in enumerate(self.received):
+            if not word or word.startswith('#'):
+                continue
+            w = word.lower()
+            # short latin words ("hi") must match a whole word, not part of "this"
+            hit = (' %s ' % w) in (' %s ' % matching) if w.isascii() and w.replace(' ', '').isalnum() else w in matching
+            if hit and i < len(self.reply) and self.reply[i]:
+                return self.reply[i]
+        return None
 
 
-def reload1():
-	for line in Pygtail("received.txt"):
-		received.append(line.strip())
-	for line in Pygtail("reply.txt"):
-	    reply.append(line.strip())
-	for line in Pygtail("blacklist.txt"):
-	 	prebloc_threads.append(line.strip())
+data = Data()
 
 
-def reload2():
-	with open('msg1.txt', encoding='utf8') as my_file1:
-	 	txt1 = my_file1.read().strip()
-	with open('msg2.txt', encoding='utf8') as my_file2:
-		txt2 = my_file2.read().strip()
-	 	        
+def normalize(text):
+    if not text:
+        return None
+    t = text.lower().translate(str.maketrans('', '', string.punctuation)).strip()
+    return t or None
 
 
 class CustomClient(Client):
-	def onMessage(self, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
-		reload1()
-		reload2()
-		localtime = datetime.now()
-		time.sleep(randrange(4,10))
-		thread = self.fetchThreadInfo(thread_id)[thread_id]
-		primary_text = auto + '\n' + thread.name + ", " + txt1 + "\nTimestamp: " + localtime
-		secondary_text = auto + '\n' + thread.name + ", " +  txt2 + "\nTimestamp: " + localtime
-		
-		index = 100000
-		
-		signal = 1
-		text = message_object.text
-		
-		try:
-			matching = text.lower()
-			matching = matching.translate(str.maketrans('', '', string.punctuation))
-		except:
-			matching = None
+    def onMessage(self, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
+        # ignore my own messages, group chats and non-text messages
+        if author_id == self.uid or thread_type != ThreadType.USER:
+            return
+        matching = normalize(message_object.text)
+        if matching is None:
+            return
 
-		'''if author_id == self.uid:
-			if thread_type != ThreadType.Group:
-				if text is 'bot100, stop replying':
-					self.send(Message(text= auto + '\n okay, stopping reply to ' + thread.name), thread_id=thread_id, thread_type=thread_type)
-					bloc_threads.append(thread_id)
-				if text is 'bot100, restart replying':
-					message_id = client.send(Message(text=auto + ' \n okay, restarting reply to ' + thread.name), thread_id=thread_id, thread_type=thread_type)
-					bloc_threads.remove(thread_id)
-				if text is 'bot100, add received':
-					message_id = client.send(Message(text=auto + ' \n okay, waiting for received data... (12 seconds remaining)'), thread_id=thread_id, thread_type=thread_type)
-					time.sleep(12)
-					if text != 'bot100, add received':
-						received.append(text + '\n')
-						with open("received.txt", "a") as my_file4:
-							my_file4.write(text + '\n')
-						message_id = client.send(Message(text=auto + ' \n added received data in array and file.'), thread_id=thread_id, thread_type=thread_type)
-				if text is 'bot100, add reply':
-					message_id = client.send(Message(text=auto + ' \n okay, waiting for reply data... (12 seconds remaining)'), thread_id=thread_id, thread_type=thread_type)
-					time.sleep(12)
-					if text != 'bot100, add reply':
-						reply.append(text + '\n')
-						with open("reply.txt", "a") as my_file5:
-							my_file5.write(text + '\n')
-						message_id = client.send(Message(text=auto + ' \n added reply data in array and file.'), thread_id=thread_id, thread_type=thread_type)
-				if text is 'bot100, shutdown':
-					message_id = client.send(Message(text=auto + ' \n Shutting Down...'), thread_id=thread_id, thread_type=thread_type)
-					time.sleep(3)
-					sys.exit()'''
-					
-		if author_id != self.uid:
-			if thread_type != ThreadType.GROUP:
-				
-				if matching != None:
-					for replies in received:
-						if matching in replies:
-							index = received.index(replies)
-							msg = auto + reply[index]
-							message_id = client.send(Message(text=msg), thread_id=thread_id, thread_type=thread_type)
-							break
-							
-				if thread_id not in prebloc_threads:
-					if thread_id not in bloc_threads:
-						if thread_id in prev_threads and matching != None and index == 100000:
-							message_id = client.send(Message(text=secondary_text), thread_id=thread_id, thread_type=thread_type)
-							bloc_threads.append(thread_id)
-			
-			
-				
-					
-					
-				if thread_id not in prev_threads and thread_id not in bloc_threads and thread_id not in prebloc_threads and matching != None and index == 100000:
-					message_id = client.send(Message(text=primary_text), thread_id=thread_id, thread_type=thread_type)
-					prev_threads.append(thread_id)
-				else:
-					None
+        data.reload()
+        if thread_id in data.blacklist:
+            return
+
+        time.sleep(randrange(4, 10))  # look human
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 1) a known word -> its specific reply
+        answer = data.find_reply(matching)
+        if answer:
+            self.send(Message(text=auto + answer), thread_id=thread_id, thread_type=thread_type)
+            return
+
+        # 2) unknown message
+        if thread_id in bloc_threads:
+            return
+        try:
+            name = self.fetchThreadInfo(thread_id)[thread_id].name or ''
+        except Exception:
+            name = ''
+        if thread_id not in prev_threads:
+            body = data.txt1
+            prev_threads.append(thread_id)
+        else:
+            body = data.txt2
+            bloc_threads.append(thread_id)
+        text = '%s\n%s, %s\nTimestamp: %s' % (auto, name, body, stamp)
+        self.send(Message(text=text.replace(' ,', ',')), thread_id=thread_id, thread_type=thread_type)
+
 
 try:
-	print('Checking for cookies...')
-	session_cookies = pickle.load(open('cookies.p','rb'))
-	client = CustomClient("cookie", "cookie", session_cookies = session_cookies) # replace your username and password here
-	print('Cookies found!')
-except:
-	print('Cookies not found. Please enter credentials.')
-	client = CustomClient(input('Email: '), getpass('Password: ')) # replace your username and password here
-	session = client.getSession()
-	pickle.dump(session, open('cookies.p','wb'))
-	print('Cookies saved to cookies.p file.')
-
+    print('Checking for cookies...')
+    with open('cookies.p', 'rb') as f:
+        session_cookies = pickle.load(f)
+    client = CustomClient('cookie', 'cookie', session_cookies=session_cookies)
+    print('Cookies found!')
+except Exception:
+    print('Cookies not found or expired. Please enter credentials.')
+    client = CustomClient(input('Email: '), getpass('Password: '))
+    with open('cookies.p', 'wb') as f:
+        pickle.dump(client.getSession(), f)
+    print('Cookies saved to cookies.p file.')
 
 print('Starting program...')
 client.listen()
