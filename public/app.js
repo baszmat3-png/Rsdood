@@ -98,6 +98,12 @@ async function start() {
   window.removeEventListener('hashchange', route);
   window.addEventListener('hashchange', route);
   route();
+  const qs = new URLSearchParams(location.search);
+  if (qs.has('meta') || qs.has('meta_error')) {
+    if (qs.has('meta_error')) toast(qs.get('meta_error'), true);
+    else toast(`تم ربط ${qs.get('meta')} حساب بنجاح ✅` + (qs.get('meta_failed') ? ` (تعذّر ${qs.get('meta_failed')})` : ''));
+    history.replaceState(null, '', location.pathname + location.hash);
+  }
 }
 
 async function route() {
@@ -262,6 +268,11 @@ VIEWS.accounts = async (v) => {
   accountsCache = list;
   v.innerHTML = head('الحسابات', 'اربط صفحاتك وبوتاتك ليتمكّن النظام من استقبال التعليقات والرسائل والرد عليها.', '<button class="btn primary" id="newa">+ ربط حساب</button>') +
     `<div class="stack">
+    <section class="panel panel-pad"><h2 style="margin-bottom:6px">المتابعة بحساب فيسبوك</h2>
+      <p class="muted small" style="margin:0 0 10px">سجّل الدخول بفيسبوك ووافق على الصلاحيات، فتُربط صفحاتك وحسابات إنستغرام المرتبطة بها تلقائياً ويُفعَّل استقبال التعليقات والرسائل، دون نسخ أي توكن.</p>
+      ${info.metaConnect.ready ? '<button class="btn primary" id="fbc">المتابعة بحساب فيسبوك</button>' : `<form id="fbf" class="cols"><div class="field"><label class="lbl" for="m1">App ID</label><input id="m1" type="text" name="fb_app_id" class="ltr" value="${esc(info.metaConnect.appId)}" required></div><div class="field"><label class="lbl" for="m2">App Secret</label><input id="m2" type="password" name="app_secret" autocomplete="off" required></div><div><button class="btn primary">حفظ وتفعيل الزر</button></div></form><p class="hint">من Meta for Developers ← إعدادات التطبيق ← أساسي.</p>`}
+      <div class="kv"><span>Valid OAuth Redirect URI</span><code class="ltr">${esc(info.metaConnect.redirect)}</code>${copyBtn(info.metaConnect.redirect)}</div>
+      <p class="hint">ضع هذا الرابط في Meta ← Facebook Login ← Settings ← Valid OAuth Redirect URIs. قبل اجتياز مراجعة التطبيق يعمل الربط لحسابات المطورين والمختبرين فقط.</p></section>
     <section class="panel panel-pad"><h2 style="margin-bottom:6px">ويب هوك ميتا (فيسبوك وإنستغرام وواتساب)</h2>
       <p class="muted small" style="margin:0 0 4px">الصق هذين القيمتين في إعدادات Webhooks داخل تطبيقك في Meta for Developers، واشترك في أحداث: <span class="ltr">feed</span> للصفحات، <span class="ltr">comments</span> و<span class="ltr">messages</span> لإنستغرام، و<span class="ltr">messages</span> لواتساب.</p>
       <div class="kv"><span>عنوان الاستدعاء</span><code class="ltr">${esc(info.metaWebhook)}</code>${copyBtn(info.metaWebhook)}<span>رمز التحقق</span><code class="ltr">${esc(info.verifyToken)}</code>${copyBtn(info.verifyToken)}</div>
@@ -274,6 +285,8 @@ VIEWS.accounts = async (v) => {
         </div><div class="acts">${a.channel === 'telegram' ? `<button class="btn sm" data-tg="${a.id}">تفعيل الويب هوك</button>` : ''}<button class="btn sm" data-edit="${a.id}">تعديل</button><button class="btn sm danger" data-del="${a.id}">حذف</button></div></div>`).join('')}</div>`
       : '<div class="empty"><h3>لا توجد حسابات مربوطة</h3><p>اربط صفحة فيسبوك أو حساب إنستغرام أو بوت تيليغرام للبدء.</p></div>'}</section></div>`;
   wireCopy(v);
+  $('#fbc')?.addEventListener('click', (ev) => guarded(ev.currentTarget, async () => { const r = await api('POST', '/api/meta/connect'); location.href = r.url; }));
+  $('#fbf')?.addEventListener('submit', async (ev) => { ev.preventDefault(); await guarded($('button', ev.target), async () => { await saveSettings(ev.target); info = await api('GET', '/api/info'); toast('تم الحفظ'); route(); }); });
   $('#newa').addEventListener('click', () => accountDialog(null));
   $$('[data-edit]', v).forEach((b) => b.addEventListener('click', () => accountDialog(list.find((a) => a.id == b.dataset.edit))));
   $$('[data-del]', v).forEach((b) => b.addEventListener('click', async () => {

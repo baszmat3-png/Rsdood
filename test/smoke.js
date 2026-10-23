@@ -11,6 +11,20 @@ process.env.ADMIN_PASSWORD = 'test-pass-123';
 process.env.APP_SECRET = 'appsecret';
 delete process.env.ANTHROPIC_API_KEY;
 
+// خادم Graph وهمي لاختبار الربط بفيسبوك
+import http from 'node:http';
+const subs = [];
+const graphMock = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://x');
+  res.setHeader('content-type', 'application/json');
+  if (u.pathname.endsWith('/oauth/access_token')) return res.end(JSON.stringify({ access_token: 'USERTOKEN' }));
+  if (u.pathname.endsWith('/me/accounts')) return res.end(JSON.stringify({ data: [{ id: 'P1', name: 'صفحة الندى', access_token: 'PAGETOKEN', instagram_business_account: { id: 'IG1', username: 'nada' } }] }));
+  if (u.pathname.endsWith('/subscribed_apps')) { subs.push(u.pathname); return res.end('{"success":true}'); }
+  res.statusCode = 404; res.end('{}');
+});
+await new Promise((r) => graphMock.listen(0, r));
+process.env.GRAPH_HOST = `http://127.0.0.1:${graphMock.address().port}`;
+
 const { server } = await import('../server.js');
 await new Promise((r) => server.listen(0, r));
 const base = `http://127.0.0.1:${server.address().port}`;
@@ -31,6 +45,27 @@ const ok = (name) => console.log('  ✓', name);
 assert.equal((await api('GET', '/api/overview')).status, 401); ok('الواجهة محمية');
 assert.equal((await api('POST', '/api/login', { password: 'x' })).status, 401); ok('رفض كلمة مرور خاطئة');
 assert.equal((await api('POST', '/api/login', { password: 'test-pass-123' })).status, 200); ok('تسجيل الدخول');
+
+// الربط بفيسبوك
+assert.equal((await api('POST', '/api/meta/connect')).status, 400); ok('الربط بفيسبوك يتطلب App ID');
+await api('PUT', '/api/settings', { fb_app_id: '123456' });
+const cb = await fetch(base + '/auth/meta/callback?state=bad&code=x').then((r) => r.text());
+assert.ok(cb.includes('meta_error')); ok('رفض state غير صالح في العودة من فيسبوك');
+assert.equal((await api('POST', '/api/meta/connect')).status, 400); // الموقع محلي وليس HTTPS
+await api('PUT', '/api/settings', { public_url: 'https://example.com' });
+const c2 = await api('POST', '/api/meta/connect');
+assert.equal(c2.status, 200);
+const au = new URL(c2.data.url);
+assert.equal(au.searchParams.get('client_id'), '123456');
+assert.equal(au.searchParams.get('redirect_uri'), 'https://example.com/auth/meta/callback');
+const okPage = await fetch(base + '/auth/meta/callback?code=abc&state=' + au.searchParams.get('state')).then((r) => r.text());
+assert.ok(okPage.includes('meta=2'), okPage);
+const accs = (await api('GET', '/api/accounts')).data;
+assert.deepEqual(accs.map((a) => a.channel).sort(), ['facebook', 'instagram']);
+assert.ok(accs.every((a) => a.hasToken)); assert.equal(subs.length, 1);
+const replay = await fetch(base + '/auth/meta/callback?code=abc&state=' + au.searchParams.get('state')).then((r) => r.text());
+assert.ok(replay.includes('meta_error')); ok('الربط الكامل: صفحة + إنستغرام + اشتراك + منع إعادة الاستخدام');
+await api('PUT', '/api/settings', { public_url: '' });
 
 // الإعدادات
 await api('PUT', '/api/settings', { business_name: 'متجر الندى', business_details: 'عباية سوداء 45 ألف دينار. التوصيل لكل المحافظات.' });

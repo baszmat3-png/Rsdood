@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { all, get, run, getSetting, setSetting } from './src/db.js';
 import { processComment, processMessage } from './src/engine.js';
 import { aiConfigured } from './src/ai.js';
-import { parseMeta, verifySignature } from './src/channels/meta.js';
+import { parseMeta, verifySignature, oauthUrl, pagesFromCode, subscribePage } from './src/channels/meta.js';
 import { parseTelegram, setWebhook } from './src/channels/telegram.js';
 import { parseTikTok } from './src/channels/tiktok.js';
 import { CHANNELS } from './src/channels/index.js';
@@ -105,7 +105,7 @@ const baseUrl = () => (process.env.PUBLIC_URL || getSetting('public_url') || `ht
 const SECRET_KEYS = ['ai_key', 'app_secret'];
 const SETTING_KEYS = [
   'business_name', 'business_about', 'business_details', 'tone', 'handoff_words', 'handoff_reply', 'fallback_reply',
-  'ai_provider', 'ai_model', 'ai_base', 'delay_min', 'delay_max', 'hourly_cap', 'public_url', ...SECRET_KEYS,
+  'ai_provider', 'ai_model', 'ai_base', 'delay_min', 'delay_max', 'hourly_cap', 'public_url', 'fb_app_id', ...SECRET_KEYS,
 ];
 const DEFAULTS = {
   tone: 'ودّي ومهني', ai_provider: 'anthropic', ai_model: 'claude-sonnet-5-5', delay_min: '3', delay_max: '12', hourly_cap: '200',
@@ -157,6 +157,45 @@ function dispatch(ev, account) {
   const full = { ...ev, account };
   const p = ev.kind === 'comment' ? processComment(full) : processMessage(full);
   p.catch((e) => console.error('[engine]', e));
+}
+
+/* ---------- الربط بحساب فيسبوك (OAuth) ---------- */
+
+const oauthStates = new Map();
+const metaApp = () => ({ appId: process.env.FB_APP_ID || getSetting('fb_app_id'), appSecret: process.env.APP_SECRET || getSetting('app_secret') });
+const metaRedirect = () => `${baseUrl()}/auth/meta/callback`;
+function upsertAccount(channel, name, externalId, token) {
+  const ex = get('SELECT id FROM accounts WHERE channel = ? AND external_id = ?', channel, externalId);
+  if (ex) { run('UPDATE accounts SET name = ?, token = ?, active = 1 WHERE id = ?', name, token, ex.id); return; }
+  run('INSERT INTO accounts(channel,name,external_id,token,extra,active,created_at) VALUES(?,?,?,?,?,1,?)',
+    channel, name, externalId, token, JSON.stringify({ secret: crypto.randomBytes(24).toString('hex') }), Date.now());
+}
+// الكوكي SameSite=Strict لا يُرسل بعد العودة من فيسبوك، لذلك نعيد التوجيه من صفحتنا نفسها (meta refresh)
+const bounce = (res, query) => send(res, 200, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/?${query}#/accounts"><title>…</title><body style="font-family:sans-serif;text-align:center;padding:48px">جارٍ العودة إلى المنصة…</body>`, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+async function handleMetaCallback(res, url) {
+  const state = url.searchParams.get('state') || '';
+  const exp = oauthStates.get(state);
+  oauthStates.delete(state);
+  if (!exp || exp < Date.now()) return bounce(res, 'meta_error=' + encodeURIComponent('انتهت صلاحية الطلب، أعد المحاولة'));
+  const code = url.searchParams.get('code');
+  if (!code) return bounce(res, 'meta_error=' + encodeURIComponent('تم إلغاء الربط'));
+  try {
+    const { appId, appSecret } = metaApp();
+    const pages = await pagesFromCode({ appId, appSecret, redirect: metaRedirect(), code });
+    if (!pages.length) return bounce(res, 'meta_error=' + encodeURIComponent('لم تُمنح صلاحية أي صفحة. أعد الربط واختر صفحتك'));
+    let n = 0, failed = 0;
+    for (const p of pages) {
+      const sub = await subscribePage(p);
+      if (!sub.ok) { failed += 1; console.error('[meta] subscribe', p.id, sub.error); continue; }
+      upsertAccount('facebook', p.name, p.id, p.token); n += 1;
+      if (p.ig) { upsertAccount('instagram', '@' + (p.ig.username || p.name), p.ig.id, p.token); n += 1; }
+    }
+    if (!n) return bounce(res, 'meta_error=' + encodeURIComponent('تعذّر تفعيل الاستقبال على الصفحة. تأكد من صلاحية pages_manage_metadata'));
+    return bounce(res, `meta=${n}` + (failed ? `&meta_failed=${failed}` : ''));
+  } catch (e) {
+    console.error('[meta]', e.message);
+    return bounce(res, 'meta_error=' + encodeURIComponent(e.message));
+  }
 }
 
 /* ---------- المسارات ---------- */
@@ -235,7 +274,18 @@ async function handleApi(req, res, url) {
       baseUrl: baseUrl(), metaWebhook: `${baseUrl()}/webhook/meta`, verifyToken: getSetting('verify_token'),
       aiConfigured: aiConfigured(), appSecretSet: !!(process.env.APP_SECRET || getSetting('app_secret')),
       passwordFromEnv: !!process.env.ADMIN_PASSWORD, channels: CHANNELS,
+      metaConnect: { ready: !!(metaApp().appId && metaApp().appSecret), redirect: metaRedirect(), appId: metaApp().appId || '' },
     });
+  }
+
+  if (p === '/api/meta/connect' && method === 'POST') {
+    const { appId, appSecret } = metaApp();
+    if (!appId || !appSecret) return json(res, 400, { error: 'أدخل App ID و App Secret أولاً' });
+    if (!baseUrl().startsWith('https://')) return json(res, 400, { error: 'يلزم عنوان HTTPS عام (PUBLIC_URL) لتسجيل الدخول بفيسبوك' });
+    for (const [k, v] of oauthStates) if (v < Date.now()) oauthStates.delete(k);
+    const state = crypto.randomBytes(24).toString('hex');
+    oauthStates.set(state, Date.now() + 10 * 60_000);
+    return json(res, 200, { url: oauthUrl(appId, metaRedirect(), state) });
   }
 
   if (p === '/api/overview' && method === 'GET') {
@@ -412,6 +462,7 @@ function serveStatic(req, res, url) {
 export const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
+    if (url.pathname === '/auth/meta/callback' && req.method === 'GET') return await handleMetaCallback(res, url);
     if (url.pathname.startsWith('/webhook/')) return await handleWebhooks(req, res, url);
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET') return send(res, 405, 'method not allowed');

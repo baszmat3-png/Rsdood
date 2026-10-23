@@ -15,6 +15,36 @@ async function graph(path, token, body) {
   return { ok: true, data: j };
 }
 
+async function gget(path, params, token) {
+  const u = new URL(`${HOST}/${VERSION}/${path}`);
+  for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, v);
+  const r = await fetch(u, { headers: token ? { authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(20000) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+  return j;
+}
+
+const SCOPES = ['pages_show_list', 'pages_messaging', 'pages_manage_metadata', 'pages_manage_engagement', 'pages_read_engagement',
+  'instagram_basic', 'instagram_manage_comments', 'instagram_manage_messages'];
+
+/** رابط تسجيل الدخول بفيسبوك (OAuth). */
+export function oauthUrl(appId, redirect, state) {
+  const u = new URL(`https://www.facebook.com/${VERSION}/dialog/oauth`);
+  u.search = new URLSearchParams({ client_id: appId, redirect_uri: redirect, state, response_type: 'code', scope: SCOPES.join(',') }).toString();
+  return u.toString();
+}
+
+/** يبدّل الكود بتوكن طويل الأمد ثم يجلب الصفحات (وتوكناتها الدائمة) وحسابات إنستغرام المرتبطة بها. */
+export async function pagesFromCode({ appId, appSecret, redirect, code }) {
+  const t1 = await gget('oauth/access_token', { client_id: appId, client_secret: appSecret, redirect_uri: redirect, code });
+  const t2 = await gget('oauth/access_token', { grant_type: 'fb_exchange_token', client_id: appId, client_secret: appSecret, fb_exchange_token: t1.access_token });
+  const r = await gget('me/accounts', { fields: 'id,name,access_token,instagram_business_account{id,username}', limit: '100' }, t2.access_token);
+  return (r.data || []).map((p) => ({ id: p.id, name: p.name, token: p.access_token, ig: p.instagram_business_account || null }));
+}
+
+/** اشتراك الصفحة في أحداث التطبيق (التعليقات والرسائل). */
+export const subscribePage = (page) => graph(`${page.id}/subscribed_apps`, page.token, { subscribed_fields: 'feed,messages' });
+
 /** التحقق من توقيع ميتا (X-Hub-Signature-256) باستخدام App Secret. */
 export function verifySignature(rawBody, header, appSecret) {
   if (!appSecret) return true;
