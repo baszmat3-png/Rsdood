@@ -14,6 +14,8 @@ const ICONS = {
   link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 0l-3 3A4 4 0 0011 18.7l1-1"/>',
   book: '<path d="M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2V5zM4 19a2 2 0 012-2h13"/>',
   flask: '<path d="M9 3h6M10 3v6L4.5 19a1.5 1.5 0 001.3 2.2h12.4a1.5 1.5 0 001.3-2.2L14 9V3M7.5 15h9"/>',
+  form: '<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4h6v3H9zM8.5 12h7M8.5 16h5"/>',
+  table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/>',
   list: '<path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/>',
 };
@@ -68,6 +70,7 @@ const statusChip = (e) => { const [t, c] = STATUS[e.status] || [e.status, '']; r
 
 const PAGES = [
   ['overview', 'نظرة عامة', 'home'], ['campaigns', 'الحملات', 'flow'], ['accounts', 'الحسابات', 'link'],
+  ['forms', 'نماذج الحجز والطلب', 'form'], ['submissions', 'الطلبات والحجوزات', 'table'],
   ['business', 'معلومات النشاط', 'book'], ['playground', 'التجربة', 'flask'], ['log', 'السجل', 'list'], ['settings', 'الإعدادات', 'gear'],
 ];
 const brandMark = '<svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#2B3E63"/><g fill="none" stroke-linecap="round" stroke-width="2.6"><path d="M21 9.5a8 8 0 0 1 0 13" stroke="#E39B0B"/><path d="M16.5 12a4.6 4.6 0 0 1 0 8" stroke="#2CC9B5"/></g><circle cx="11.5" cy="16" r="2.6" fill="#fff"/></svg>';
@@ -416,6 +419,111 @@ VIEWS.log = async (v) => {
   };
   $('#lk').addEventListener('change', load); $('#ls').addEventListener('change', load);
   await load();
+};
+
+
+/* ---------- نماذج الحجز والطلبات + الطلبات المستلمة ---------- */
+
+const FT = { text: 'نص', phone: 'هاتف', number: 'رقم', date: 'تاريخ', time: 'وقت', choice: 'اختيار' };
+const FT_BY_NAME = Object.fromEntries(Object.entries(FT).map(([k, v]) => [v, k]));
+const SUB_STATUS = { new: ['جديد', 'saffron'], confirmed: ['مؤكد', 'teal'], done: ['منجز', 'ink'], cancelled: ['ملغي', 'coral'] };
+const SAMPLE = {
+  booking: { name: 'حجز موعد', kind: 'booking', triggers: 'حجز, موعد, احجز', intro: '', done_text: '',
+    fields: [{ label: 'ما اسمك الكامل؟', type: 'text' }, { label: 'رقم هاتفك؟', type: 'phone' }, { label: 'أي يوم يناسبك؟', type: 'date' }, { label: 'أي وقت يناسبك؟', type: 'time' }, { label: 'نوع الخدمة؟', type: 'choice', options: ['كشف', 'متابعة', 'استشارة'] }, { label: 'ملاحظات', type: 'text', optional: true }] },
+  order: { name: 'طلب منتج', kind: 'order', triggers: 'اطلب, طلب, شراء, اريد اشتري', intro: '', done_text: '',
+    fields: [{ label: 'ما اسمك الكامل؟', type: 'text' }, { label: 'رقم هاتفك؟', type: 'phone' }, { label: 'ما المنتج المطلوب؟', type: 'text' }, { label: 'الكمية؟', type: 'number' }, { label: 'المحافظة والعنوان؟', type: 'text' }, { label: 'ملاحظات', type: 'text', optional: true }] },
+};
+const fieldsToText = (fs) => fs.map((f) => [f.label + (f.optional ? ' (اختياري)' : ''), FT[f.type] || 'نص', ...(f.type === 'choice' ? [f.options.join('، ')] : [])].join(' | ')).join('\n');
+function textToFields(txt) {
+  return txt.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+    const [a, b, c] = l.split('|').map((x) => x.trim());
+    const optional = /\(اختياري\)\s*$/.test(a);
+    const type = FT_BY_NAME[b] || (b && Object.keys(FT).includes(b) ? b : 'text');
+    return { label: a.replace(/\(اختياري\)\s*$/, '').trim(), type, optional, options: type === 'choice' ? String(c || '').split(/[,،]/).map((x) => x.trim()).filter(Boolean) : [] };
+  });
+}
+
+VIEWS.forms = async (v) => {
+  const list = await api('GET', '/api/forms');
+  v.innerHTML = head('نماذج الحجز والطلب', 'يسأل البوت العميل سؤالاً سؤالاً في الرسائل الخاصة، يتحقق من الأجوبة، ثم يحفظ الطلب لتراه وتصدّره إلى Excel.',
+    '<button class="btn primary" id="nb">+ نموذج حجز</button> <button class="btn" id="no">+ نموذج طلب</button>') +
+    `<section class="panel">${list.length ? `<div class="rows">${list.map((f) => `
+      <div class="row ${f.active ? '' : 'off'}"><div><h3>${esc(f.name)} <span class="chip ${f.kind === 'order' ? 'saffron' : 'teal'}">${f.kind === 'order' ? 'طلب' : 'حجز'}</span></h3>
+        <div class="tags"><span class="chip">${f.fields.length} أسئلة</span><span class="chip">تبدأ بكلمات: ${esc(clipTxt(f.triggers || '— لا شيء —', 40))}</span><span class="chip ink">${f.count} مستلَم</span></div></div>
+        <div class="acts"><label class="switch" title="تفعيل"><input type="checkbox" data-toggle="${f.id}" ${f.active ? 'checked' : ''} aria-label="تفعيل ${esc(f.name)}"><span></span></label>
+        <button class="btn sm" data-test="${f.id}">جرّب</button><button class="btn sm" data-edit="${f.id}">تعديل</button><button class="btn sm danger" data-del="${f.id}">حذف</button></div></div>`).join('')}</div>`
+      : '<div class="empty"><h3>لا توجد نماذج</h3><p>أنشئ نموذج حجز أو طلب، وعندما يكتب العميل «حجز» أو «اطلب» يبدأ البوت بالأسئلة.</p></div>'}</section>
+    <p class="muted small" style="margin-top:12px">يعمل النموذج في الرسائل الخاصة (فيسبوك، إنستغرام، واتساب، تيليغرام). ويمكن توجيه العميل إليه من رسالة الحملة: «اكتب حجز لتبدأ».</p>`;
+  $('#nb').addEventListener('click', () => formDialog(null, 'booking'));
+  $('#no').addEventListener('click', () => formDialog(null, 'order'));
+  $$('[data-edit]', v).forEach((b) => b.addEventListener('click', () => formDialog(list.find((f) => f.id == b.dataset.edit))));
+  $$('[data-test]', v).forEach((b) => b.addEventListener('click', () => formTest(list.find((f) => f.id == b.dataset.test))));
+  $$('[data-del]', v).forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('حذف النموذج؟ تبقى الطلبات المستلمة محفوظة.')) return;
+    await guarded(b, async () => { await api('DELETE', `/api/forms/${b.dataset.del}`); toast('تم الحذف'); route(); });
+  }));
+  $$('[data-toggle]', v).forEach((i) => i.addEventListener('change', async () => {
+    try { await api('PUT', `/api/forms/${i.dataset.toggle}`, { active: i.checked }); route(); } catch (e) { toast(e.message, true); i.checked = !i.checked; }
+  }));
+};
+
+function formDialog(f, kind = 'booking') {
+  const x = f || SAMPLE[kind];
+  const body = `
+  <div class="field"><label class="lbl" for="g-name">اسم النموذج</label><input id="g-name" name="name" type="text" required value="${esc(x.name)}"></div>
+  <div class="cols"><div class="field"><label class="lbl" for="g-kind">النوع</label><select id="g-kind" name="kind"><option value="booking" ${x.kind !== 'order' ? 'selected' : ''}>حجز موعد</option><option value="order" ${x.kind === 'order' ? 'selected' : ''}>طلب منتج</option></select></div>
+  <div class="field"><label class="lbl" for="g-tr">كلمات تبدأ النموذج</label><input id="g-tr" name="triggers" type="text" value="${esc(x.triggers)}"><span class="hint">إذا احتوت رسالة العميل إحداها يبدأ البوت بالأسئلة. افصل بفاصلة.</span></div></div>
+  <div class="field"><label class="lbl" for="g-fields">الأسئلة (سطر لكل سؤال)</label><textarea id="g-fields" name="fields_text" style="min-height:180px" required>${esc(fieldsToText(x.fields))}</textarea>
+    <span class="hint">الصيغة: <span class="ltr">السؤال | النوع | الخيارات</span>. الأنواع: نص، هاتف، رقم، تاريخ، وقت، اختيار. مثال: <span class="ltr">نوع الخدمة؟ | اختيار | كشف، متابعة</span>. أضف <b>(اختياري)</b> بعد السؤال ليستطيع العميل تخطيه. عنوان عمود Excel = نص السؤال.</span></div>
+  <div class="field"><label class="lbl" for="g-intro">رسالة البداية (اختياري)</label><textarea id="g-intro" name="intro" style="min-height:60px" placeholder="أهلاً {name} 🌷 سأسجّل طلبك الآن...">${esc(x.intro)}</textarea></div>
+  <div class="field"><label class="lbl" for="g-done">رسالة التأكيد (اختياري)</label><textarea id="g-done" name="done_text" style="min-height:70px" placeholder="شكراً {name}! تم تسجيل طلبك رقم {id} ✅&#10;{summary}">${esc(x.done_text)}</textarea><span class="hint">المتغيرات: {name} الاسم، {id} رقم الطلب، {summary} ملخص الأجوبة.</span></div>
+  ${f ? `<label class="check"><input type="checkbox" name="active" ${f.active ? 'checked' : ''}>النموذج مفعّل</label>` : ''}`;
+  const d = dialog(f ? 'تعديل النموذج' : (kind === 'order' ? 'نموذج طلب جديد' : 'نموذج حجز جديد'), body, f ? 'حفظ' : 'إنشاء النموذج', async (fd) => {
+    const p = Object.fromEntries(fd);
+    p.fields = textToFields(p.fields_text); delete p.fields_text;
+    if (f) p.active = fd.has('active');
+    await api(f ? 'PUT' : 'POST', f ? `/api/forms/${f.id}` : '/api/forms', p);
+    toast('تم الحفظ'); d.close(); route();
+  });
+}
+
+function formTest(f) {
+  const sim = Math.random().toString(36).slice(2, 10);
+  const d = dialog(`تجربة: ${esc(f.name)}`, `<p class="muted small" style="margin:0 0 10px">اكتب إحدى كلمات البدء (مثلاً «${esc((f.triggers.split(/[,،]/)[0] || 'حجز').trim())}») وأجب عن الأسئلة كما سيفعل العميل. التجربة لا تُحفظ في الطلبات.</p>
+    <div id="tlog" class="stack" style="max-height:340px;overflow:auto;margin-bottom:10px"></div>
+    <div class="field"><input id="tin" type="text" placeholder="اكتب رسالتك…" autocomplete="off"></div>`, 'إرسال', async () => {
+    const inp = $('#tin', d); const text = inp.value.trim(); if (!text) return;
+    inp.value = '';
+    const log = $('#tlog', d);
+    log.insertAdjacentHTML('beforeend', `<div class="bubble"><div class="who">العميل</div><div class="txt">${esc(text)}</div></div>`);
+    const r = await api('POST', '/api/simulate', { kind: 'message', channel: 'facebook', text, sim_user: sim, user_name: 'أحمد' });
+    log.insertAdjacentHTML('beforeend', `<div class="bubble" style="background:var(--saffron-soft)"><div class="who">البوت</div><div class="txt">${esc(r.dmReply || '(لا رد)')}</div></div>`);
+    log.scrollTop = log.scrollHeight; inp.focus();
+  });
+  $('#tin', d).focus();
+}
+
+let SUBF = { form: '', status: '' };
+VIEWS.submissions = async (v) => {
+  const [forms, rows] = await Promise.all([api('GET', '/api/forms'), api('GET', `/api/submissions?form_id=${SUBF.form}&status=${SUBF.status}`)]);
+  const q = `form_id=${SUBF.form}&status=${SUBF.status}`;
+  v.innerHTML = head('الطلبات والحجوزات', 'كل ما أجاب عنه العملاء، مرتّباً. حدّث الحالة، أو حمّله ملف Excel.',
+    `<a class="btn primary" href="/api/submissions.xlsx?${q}" download>⬇ تحميل Excel</a>`) +
+    `<section class="panel panel-pad" style="margin-bottom:14px"><div class="cols"><div class="field"><label class="lbl" for="sf1">النموذج</label><select id="sf1"><option value="">كل النماذج</option>${forms.map((f) => `<option value="${f.id}" ${SUBF.form == f.id ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>
+    <div class="field"><label class="lbl" for="sf2">الحالة</label><select id="sf2"><option value="">كل الحالات</option>${Object.entries(SUB_STATUS).map(([k, [t]]) => `<option value="${k}" ${SUBF.status == k ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div></section>
+    <section class="panel">${rows.length ? `<div class="rows">${rows.map((r) => `
+      <div class="row"><div><h3>#${r.id} · ${esc(r.answers[Object.keys(r.answers)[0]] || r.user_name || 'عميل')} <span class="chip ink">${chan(r.channel)}</span> <span class="chip">${esc(r.form_name || '')}</span></h3>
+        <div class="small" style="line-height:1.9">${Object.entries(r.answers).filter(([, a]) => a).map(([k, a]) => `<span class="muted">${esc(k)}:</span> <b>${esc(a)}</b>`).join(' &nbsp;·&nbsp; ')}</div>
+        <div class="small muted" style="margin-top:4px">${fmtTime(r.created_at)}</div></div>
+        <div class="acts"><select data-st="${r.id}" aria-label="حالة الطلب ${r.id}">${Object.entries(SUB_STATUS).map(([k, [t]]) => `<option value="${k}" ${r.status === k ? 'selected' : ''}>${t}</option>`).join('')}</select><button class="btn sm danger" data-del="${r.id}">حذف</button></div></div>`).join('')}</div>`
+      : '<div class="empty"><h3>لا توجد طلبات بعد</h3><p>ستظهر هنا فور أن يُكمل أحد العملاء أسئلة النموذج.</p></div>'}</section>`;
+  $('#sf1').addEventListener('change', (e) => { SUBF.form = e.target.value; route(); });
+  $('#sf2').addEventListener('change', (e) => { SUBF.status = e.target.value; route(); });
+  $$('[data-st]', v).forEach((sel) => sel.addEventListener('change', async () => { try { await api('PUT', `/api/submissions/${sel.dataset.st}`, { status: sel.value }); toast('تم تحديث الحالة'); } catch (e) { toast(e.message, true); } }));
+  $$('[data-del]', v).forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('حذف هذا الطلب نهائياً؟')) return;
+    await guarded(b, async () => { await api('DELETE', `/api/submissions/${b.dataset.del}`); toast('تم الحذف'); route(); });
+  }));
 };
 
 /* ---------- الإقلاع ---------- */

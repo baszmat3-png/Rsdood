@@ -1,6 +1,7 @@
 import { all, get, run, getSetting } from './db.js';
 import { complete, baseSystem, aiConfigured } from './ai.js';
 import { adapters } from './channels/index.js';
+import { handleFormTurn, clearFormSession } from './forms.js';
 
 /* ---------- أدوات النصوص ---------- */
 
@@ -245,9 +246,13 @@ export async function processMessage(ev, opts = {}) {
 
   let reply;
   let status = 'done';
+  let formTurn = null;
   if (wantsHuman) {
+    clearFormSession(ev);
     reply = getSetting('handoff_reply', 'تم تحويل رسالتك إلى فريقنا وسيتواصل معك أحد المختصين في أقرب وقت 🌷');
     status = 'handoff';
+  } else if ((formTurn = handleFormTurn(ev, simulate))) {
+    reply = clip(formTurn.reply, 1900);
   } else {
     const past = history(ev.channel, ev.userId);
     const msgs = [...past.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text }))];

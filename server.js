@@ -10,6 +10,8 @@ import { parseMeta, verifySignature, oauthUrl, pagesFromCode, subscribePage } fr
 import { parseTelegram, setWebhook } from './src/channels/telegram.js';
 import { parseTikTok } from './src/channels/tiktok.js';
 import { CHANNELS } from './src/channels/index.js';
+import { parseForm, cleanForm, headerOf } from './src/forms.js';
+import { buildXlsx } from './src/xlsx.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -434,12 +436,82 @@ async function handleApi(req, res, url) {
   }
 
   /* المحاكاة */
+  /* النماذج (حجز / طلبات) والطلبات المستلمة */
+  if (p === '/api/forms' && method === 'GET') {
+    return json(res, 200, all('SELECT * FROM forms ORDER BY id DESC').map((r) => ({ ...parseForm(r), count: get('SELECT COUNT(*) n FROM submissions WHERE form_id = ? AND simulated = 0', r.id).n })));
+  }
+  if (p === '/api/forms' && method === 'POST') {
+    const c = cleanForm(body);
+    if (c.error) return json(res, 400, { error: c.error });
+    const v = c.value;
+    const r = run('INSERT INTO forms(name,kind,triggers,intro,fields,done_text,active,created_at) VALUES(?,?,?,?,?,?,?,?)', v.name, v.kind, v.triggers, v.intro, v.fields, v.done_text, v.active, Date.now());
+    return json(res, 201, parseForm(get('SELECT * FROM forms WHERE id = ?', r.lastInsertRowid)));
+  }
+  let fm = p.match(/^\/api\/forms\/(\d+)$/);
+  if (fm) {
+    const id = Number(fm[1]);
+    const cur = get('SELECT * FROM forms WHERE id = ?', id);
+    if (!cur) return json(res, 404, { error: 'النموذج غير موجود' });
+    if (method === 'DELETE') { run('DELETE FROM forms WHERE id = ?', id); run('DELETE FROM form_sessions WHERE form_id = ?', id); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      if (Object.keys(body).length === 1 && body.active !== undefined) { run('UPDATE forms SET active = ? WHERE id = ?', body.active ? 1 : 0, id); return json(res, 200, { ok: true }); }
+      const c = cleanForm({ ...parseForm(cur), ...body });
+      if (c.error) return json(res, 400, { error: c.error });
+      const v = c.value;
+      run('UPDATE forms SET name=?, kind=?, triggers=?, intro=?, fields=?, done_text=?, active=? WHERE id=?', v.name, v.kind, v.triggers, v.intro, v.fields, v.done_text, v.active, id);
+      return json(res, 200, parseForm(get('SELECT * FROM forms WHERE id = ?', id)));
+    }
+  }
+  const subFilter = (q) => {
+    const where = ['s.simulated = 0']; const args = [];
+    if (q.get('form_id')) { where.push('s.form_id = ?'); args.push(Number(q.get('form_id'))); }
+    if (['new', 'confirmed', 'done', 'cancelled'].includes(q.get('status'))) { where.push('s.status = ?'); args.push(q.get('status')); }
+    return [where.join(' AND '), args];
+  };
+  if (p === '/api/submissions' && method === 'GET') {
+    const [w, a] = subFilter(url.searchParams);
+    const rows = all(`SELECT s.*, f.name AS form_name, f.kind FROM submissions s LEFT JOIN forms f ON f.id = s.form_id WHERE ${w} ORDER BY s.id DESC LIMIT 500`, ...a);
+    return json(res, 200, rows.map((r) => ({ ...r, answers: JSON.parse(r.answers || '{}') })));
+  }
+  if (p === '/api/submissions.xlsx' && method === 'GET') {
+    const [w, a] = subFilter(url.searchParams);
+    const rows = all(`SELECT s.*, f.name AS form_name FROM submissions s LEFT JOIN forms f ON f.id = s.form_id WHERE ${w} ORDER BY s.id`, ...a);
+    const formId = Number(url.searchParams.get('form_id')) || null;
+    const form = formId ? parseForm(get('SELECT * FROM forms WHERE id = ?', formId)) : null;
+    const keys = form ? form.fields.map(headerOf) : [...new Set(rows.flatMap((r) => Object.keys(JSON.parse(r.answers || '{}'))))];
+    const STAT = { new: 'جديد', confirmed: 'مؤكد', done: 'منجز', cancelled: 'ملغي' };
+    const header = ['#', 'التاريخ', ...(form ? [] : ['النموذج']), 'القناة', 'الاسم في المنصة', ...keys, 'الحالة', 'ملاحظة'];
+    const data = rows.map((r) => {
+      const ans = JSON.parse(r.answers || '{}');
+      return [r.id, new Date(r.created_at + TZ).toISOString().replace('T', ' ').slice(0, 16), ...(form ? [] : [r.form_name || '']), CHANNELS[r.channel] || r.channel, r.user_name, ...keys.map((k) => ans[k] ?? ''), STAT[r.status] || r.status, r.note];
+    });
+    const buf = buildXlsx([header, ...data], { sheet: form ? form.name : 'الطلبات', widths: [6, 17, ...(form ? [] : [20]), 12, 18, ...keys.map(() => 24), 10, 24] });
+    return send(res, 200, buf, {
+      'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'content-disposition': `attachment; filename="submissions-${new Date().toISOString().slice(0, 10)}.xlsx"`, 'cache-control': 'no-store',
+    });
+  }
+  fm = p.match(/^\/api\/submissions\/(\d+)$/);
+  if (fm) {
+    const id = Number(fm[1]);
+    if (!get('SELECT 1 x FROM submissions WHERE id = ?', id)) return json(res, 404, { error: 'غير موجود' });
+    if (method === 'DELETE') { run('DELETE FROM submissions WHERE id = ?', id); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      if (body.status !== undefined) {
+        if (!['new', 'confirmed', 'done', 'cancelled'].includes(body.status)) return json(res, 400, { error: 'حالة غير صالحة' });
+        run('UPDATE submissions SET status = ? WHERE id = ?', body.status, id);
+      }
+      if (body.note !== undefined) run('UPDATE submissions SET note = ? WHERE id = ?', String(body.note).slice(0, 500), id);
+      return json(res, 200, { ok: true });
+    }
+  }
+
   if (p === '/api/simulate' && method === 'POST') {
     const text = String(body.text || '').trim();
     if (!text) return json(res, 400, { error: 'اكتب نص التعليق أو الرسالة' });
     const ev = {
       channel: CHANNELS[body.channel] ? body.channel : 'facebook', postId: String(body.post_id || '').trim(), commentId: '',
-      userId: `sim-${crypto.randomBytes(4).toString('hex')}`, userName: String(body.user_name || 'أحمد').trim(), text, account: null,
+      userId: body.sim_user ? `sim-${String(body.sim_user).replace(/[^\w-]/g, '').slice(0, 24)}` : `sim-${crypto.randomBytes(4).toString('hex')}`, userName: String(body.user_name || 'أحمد').trim(), text, account: null,
     };
     const result = body.kind === 'message' ? await processMessage(ev, { simulate: true }) : await processComment(ev, { simulate: true });
     return json(res, 200, { ...result, aiConfigured: aiConfigured() });

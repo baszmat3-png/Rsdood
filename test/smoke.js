@@ -117,6 +117,34 @@ assert.equal(ov.days.length, 14); ok('نظرة عامة');
 r = await fetch(base + '/../../etc/passwd'); assert.notEqual(r.status, 200);
 r = await fetch(base + '/%2e%2e/server.js'); assert.equal(r.status, 404); ok('حماية مسارات الملفات');
 
+// نماذج الحجز والطلبات + تصدير Excel
+const fres = await api('POST', '/api/forms', { name: 'حجز', kind: 'booking', triggers: 'حجز, موعد', fields: [
+  { label: 'ما اسمك الكامل؟', type: 'text' }, { label: 'رقم هاتفك؟', type: 'phone' }, { label: 'أي يوم؟', type: 'date' },
+  { label: 'نوع الخدمة؟', type: 'choice', options: ['كشف', 'متابعة'] }, { label: 'ملاحظات', type: 'text', optional: true }] });
+assert.equal(fres.status, 201); ok('إنشاء نموذج حجز');
+assert.equal((await api('POST', '/api/forms', { name: 'x', fields: [{ label: 'q', type: 'choice', options: ['a'] }] })).status, 400); ok('رفض نموذج غير صالح');
+const { handleFormTurn } = await import('../src/forms.js');
+const U = { channel: 'facebook', userId: 'u-form-1', userName: 'سارة', account: null };
+const turn = (text) => handleFormTurn({ ...U, text }, false)?.reply;
+assert.match(turn('أريد حجز'), /ما اسمك الكامل/);
+assert.match(turn('سارة علي'), /رقم هاتفك/);
+assert.match(turn('abc'), /الرقم غير صحيح/);
+assert.match(turn('٠٧٧٠١٢٣٤٥٦٧'), /أي يوم/);
+assert.match(turn('غداً'), /نوع الخدمة/);
+assert.match(turn('9'), /اختر رقماً/);
+assert.match(turn('2'), /ملاحظات/);
+const doneMsg = turn('تخطي');
+assert.match(doneMsg, /تم تسجيل طلبك رقم 1/); assert.match(doneMsg, /07701234567/);
+assert.equal(handleFormTurn({ ...U, text: 'مرحبا' }, false), null); ok('محادثة الحجز كاملة مع التحقق من الأجوبة');
+const subList = (await api('GET', '/api/submissions')).data;
+assert.equal(subList.length, 1); assert.equal(subList[0].answers['رقم هاتفك'], '07701234567'); assert.equal(subList[0].answers['نوع الخدمة'], 'متابعة'); ok('حفظ الطلب');
+assert.equal((await api('PUT', '/api/submissions/1', { status: 'confirmed' })).status, 200);
+const xr = await fetch(base + '/api/submissions.xlsx?form_id=1', { headers: { cookie } });
+const xb = Buffer.from(await xr.arrayBuffer());
+assert.equal(xr.status, 200); assert.equal(xb.subarray(0, 2).toString(), 'PK'); fs.writeFileSync(path.join(tmp, 'out.xlsx'), xb);
+ok('تصدير Excel');
+assert.equal((await api('POST', '/api/simulate', { kind: 'message', text: 'حجز', sim_user: 'zz', channel: 'facebook' })).data.dmReply.includes('ما اسمك'), true); ok('التجربة تبدأ النموذج');
+
 console.log('\nنجحت كل الاختبارات');
 server.close();
 fs.rmSync(tmp, { recursive: true, force: true });

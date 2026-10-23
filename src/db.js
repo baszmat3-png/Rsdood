@@ -66,6 +66,40 @@ CREATE TABLE IF NOT EXISTS messages (
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_messages_user ON messages(channel, user_id, ts);
+CREATE TABLE IF NOT EXISTS forms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'booking',
+  triggers TEXT NOT NULL DEFAULT '',
+  intro TEXT NOT NULL DEFAULT '',
+  fields TEXT NOT NULL DEFAULT '[]',
+  done_text TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS form_sessions (
+  channel TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  form_id INTEGER NOT NULL,
+  step INTEGER NOT NULL DEFAULT 0,
+  answers TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (channel, user_id)
+);
+CREATE TABLE IF NOT EXISTS submissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  form_id INTEGER NOT NULL,
+  channel TEXT NOT NULL,
+  account_id INTEGER,
+  user_id TEXT NOT NULL,
+  user_name TEXT NOT NULL DEFAULT '',
+  answers TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'new',
+  note TEXT NOT NULL DEFAULT '',
+  simulated INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sub_form ON submissions(form_id, created_at);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
 
