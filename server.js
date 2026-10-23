@@ -1,583 +1,427 @@
-const express = require('express');
-const crypto = require('crypto');
-const path = require('path');
-const { Pool } = require('pg');
-const ExcelJS = require('exceljs');
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { all, get, run, getSetting, setSetting } from './src/db.js';
+import { processComment, processMessage } from './src/engine.js';
+import { aiConfigured } from './src/ai.js';
+import { parseMeta, verifySignature } from './src/channels/meta.js';
+import { parseTelegram, setWebhook } from './src/channels/telegram.js';
+import { parseTikTok } from './src/channels/tiktok.js';
+import { CHANNELS } from './src/channels/index.js';
 
-const E = process.env;
-const G = 'https://graph.facebook.com/v21.0';
-const FB = { token: E.FB_PAGE_TOKEN, ig: E.IG_USER_ID, pageId: '', name: '', igName: '', source: E.FB_PAGE_TOKEN ? 'env' : 'none' };
-const pool = new Pool({ connectionString: E.DATABASE_URL, ssl: E.DATABASE_URL && !E.DATABASE_URL.includes('localhost') ? { rejectUnauthorized: false } : false });
-const q = (sql, p) => pool.query(sql, p).then(r => r.rows);
-const app = express();
-app.set('trust proxy', 1);
-app.get('/health', (req, res) => res.send('ok'));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const PORT = Number(process.env.PORT || 3000);
+const TZ = Number(process.env.TZ_OFFSET_HOURS ?? 3) * 3600_000;
 
-const DEFAULTS = {
-  commentReply: 'شكراً لتعليقك 🌹 راسلناك على الخاص',
-  notifyWhatsApp: '',
-  autoLike: true, autoPublicReply: true, autoPrivateReply: true
-};
+/* ---------- تهيئة أولية ---------- */
 
-async function init() {
-  await q(`CREATE TABLE IF NOT EXISTS harvest(id SERIAL PRIMARY KEY, channel TEXT, post_id TEXT, comment_id TEXT, user_id TEXT, name TEXT, text TEXT, commented_at TIMESTAMPTZ, sent BOOLEAN DEFAULT false, UNIQUE(channel, comment_id))`);
-  await q(`CREATE TABLE IF NOT EXISTS comments(id SERIAL PRIMARY KEY, channel TEXT, comment_id TEXT, post_id TEXT, user_id TEXT, name TEXT, text TEXT, ts TIMESTAMPTZ DEFAULT now(), liked BOOLEAN DEFAULT false, replied BOOLEAN DEFAULT false, dm BOOLEAN DEFAULT false, UNIQUE(channel, comment_id))`);
-  await q(`CREATE TABLE IF NOT EXISTS plans(id SERIAL PRIMARY KEY, name TEXT, price NUMERIC DEFAULT 0, days INT DEFAULT 30)`);
-  await q(`CREATE TABLE IF NOT EXISTS subs(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, plan_id INT, plan_name TEXT, price NUMERIC DEFAULT 0, start_at TIMESTAMPTZ, end_at TIMESTAMPTZ, status TEXT DEFAULT 'active', ts TIMESTAMPTZ DEFAULT now())`);
-  await q(`CREATE TABLE IF NOT EXISTS bot_users(channel TEXT, contact TEXT, name TEXT, phone TEXT, last_seen TIMESTAMPTZ, created TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(channel, contact))`);
-  await q(`CREATE TABLE IF NOT EXISTS broadcasts(id SERIAL PRIMARY KEY, name TEXT, channel TEXT, node TEXT, template TEXT, total INT DEFAULT 0, sent INT DEFAULT 0, failed INT DEFAULT 0, status TEXT, ts TIMESTAMPTZ DEFAULT now())`);
-  await q(`CREATE TABLE IF NOT EXISTS admins(username TEXT PRIMARY KEY, pass TEXT, role TEXT)`);
-  await q(`ALTER TABLE admins ADD COLUMN IF NOT EXISTS perms JSONB`).catch(() => {});
-  await q(`CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v JSONB)`);
-  await q(`CREATE TABLE IF NOT EXISTS messages(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, dir TEXT, text TEXT, ts TIMESTAMPTZ DEFAULT now())`);
-  await q(`CREATE TABLE IF NOT EXISTS bot_sessions(channel TEXT, contact TEXT, name TEXT, node TEXT, data JSONB DEFAULT '{}', paused BOOLEAN DEFAULT false, PRIMARY KEY(channel, contact))`);
-  await q(`CREATE TABLE IF NOT EXISTS leads(id SERIAL PRIMARY KEY, channel TEXT, contact TEXT, name TEXT, answers JSONB, ts TIMESTAMPTZ DEFAULT now())`);
-  const sv = (await q(`SELECT v FROM settings WHERE k='fb'`))[0];
-  if (sv) Object.assign(FB, sv.v, { source: 'db' });
+if (!getSetting('verify_token')) setSetting('verify_token', crypto.randomBytes(16).toString('hex'));
+
+function hashPassword(pw, salt = crypto.randomBytes(16).toString('hex')) {
+  return `${salt}:${crypto.scryptSync(pw, salt, 32).toString('hex')}`;
 }
-const getSettings = async () => {
-  const r = await q(`SELECT v FROM settings WHERE k='main'`);
-  return { ...DEFAULTS, ...(r[0] ? r[0].v : {}) };
+function checkHash(pw, stored) {
+  const [salt, hex] = String(stored).split(':');
+  if (!salt || !hex) return false;
+  const a = Buffer.from(hex, 'hex');
+  const b = crypto.scryptSync(pw, salt, 32);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+if (!process.env.ADMIN_PASSWORD && !getSetting('admin_hash')) {
+  const pw = crypto.randomBytes(9).toString('base64url');
+  setSetting('admin_hash', hashPassword(pw));
+  console.log('\n==============================================');
+  console.log(' كلمة مرور لوحة التحكم (تظهر مرة واحدة فقط):');
+  console.log(' ' + pw);
+  console.log('==============================================\n');
+}
+function passwordOk(pw) {
+  if (process.env.ADMIN_PASSWORD) return safeEqual(pw, process.env.ADMIN_PASSWORD);
+  return checkHash(pw, getSetting('admin_hash'));
+}
+
+/* ---------- الجلسات وتحديد المحاولات ---------- */
+
+const sessions = new Map();
+const attempts = new Map();
+const SESSION_MS = 12 * 3600_000;
+
+function newSession() {
+  const t = crypto.randomBytes(32).toString('hex');
+  sessions.set(t, Date.now() + SESSION_MS);
+  return t;
+}
+function cookies(req) {
+  return Object.fromEntries(String(req.headers.cookie || '').split(';').map((c) => c.trim().split('=')).filter((p) => p[0]).map(([k, ...v]) => [k, v.join('=')]));
+}
+function authed(req) {
+  const t = cookies(req).sid;
+  const exp = t && sessions.get(t);
+  if (!exp) return false;
+  if (exp < Date.now()) { sessions.delete(t); return false; }
+  return true;
+}
+
+/* ---------- أدوات HTTP ---------- */
+
+const SECURITY = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
 };
 
-// ---------- Meta API ----------
-async function api(url, body, token) {
-  const r = await fetch(`${url}${url.includes('?') ? '&' : '?'}access_token=${token}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, { ...SECURITY, ...headers });
+  res.end(body);
+}
+function json(res, status, obj, headers = {}) {
+  send(res, status, JSON.stringify(obj), { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers });
+}
+function readBody(req, limit = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(Object.assign(new Error('الحمولة كبيرة جداً'), { status: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
   });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) console.error('API error', url, JSON.stringify(j));
-  j.__ok = r.ok;
-  return j;
 }
-async function log(channel, contact, name, dir, text) {
-  await q(`INSERT INTO messages(channel,contact,name,dir,text) VALUES($1,$2,$3,$4,$5)`, [channel, contact, name || '', dir, text]);
-}
-// send a DM. opts.commentId => private reply to a comment
-async function send(channel, to, text, name, opts = {}) {
-  if (channel === 'fb') {
-    await api(`${G}/me/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, messaging_type: 'RESPONSE', message: { text } }, FB.token);
-  } else if (channel === 'ig') {
-    await api(`${G}/${FB.ig}/messages`, { recipient: opts.commentId ? { comment_id: opts.commentId } : { id: to }, message: { text } }, FB.token);
-  } else if (channel === 'wa') {
-    await api(`${G}/${E.WA_PHONE_ID}/messages`, { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }, E.WA_TOKEN);
-  }
-  await log(channel, to, name, 'out', text);
-}
+const parseJson = (buf) => { try { return JSON.parse(buf.toString('utf8') || '{}'); } catch { return null; } };
 
-// ---------- Flow engine ----------
-const SEED = {
-  start: 'start',
-  fallback: 'start',
-  keywords: [{ match: 'contains', word: 'تسجيل', node: 'reg1' }, { match: 'contains', word: 'عنوان', node: 'address' }, { match: 'resume', word: 'ابدأ,start', node: 'start' }],
-  nodes: {
-    start: { type: 'msg', text: 'أهلاً {name} 👋 وسهلاً بك! اختر من القائمة:', buttons: [{ title: 'الأقسام', to: 'sections' }, { title: 'عنوان الكلية', to: 'address' }, { title: 'التسجيل', to: 'reg1' }] },
-    sections: { type: 'msg', text: 'الأقسام المتوفرة:\n1- قسم أ\n2- قسم ب', next: '', buttons: [{ title: 'رجوع', to: 'start' }] },
-    address: { type: 'msg', text: 'عنوان الكلية: اكتب العنوان هنا', buttons: [{ title: 'رجوع', to: 'start' }] },
-    reg1: { type: 'ask', text: 'ما اسمك الكامل؟', key: 'الاسم', next: 'reg2' },
-    reg2: { type: 'ask', text: 'ما رقم هاتفك؟', key: 'الهاتف', next: 'reg3' },
-    reg3: { type: 'ask', text: 'ما المحافظة؟', key: 'المحافظة', next: 'done' },
-    done: { type: 'end', text: 'شكراً لك! استلمنا معلوماتك وراح نتواصل وياك قريباً ✅' }
-  }
+const baseUrl = () => (process.env.PUBLIC_URL || getSetting('public_url') || `http://localhost:${PORT}`).replace(/\/$/, '');
+const SECRET_KEYS = ['ai_key', 'app_secret'];
+const SETTING_KEYS = [
+  'business_name', 'business_about', 'business_details', 'tone', 'handoff_words', 'handoff_reply', 'fallback_reply',
+  'ai_provider', 'ai_model', 'ai_base', 'delay_min', 'delay_max', 'hourly_cap', 'public_url', ...SECRET_KEYS,
+];
+const DEFAULTS = {
+  tone: 'ودّي ومهني', ai_provider: 'anthropic', ai_model: 'claude-sonnet-5-5', delay_min: '3', delay_max: '12', hourly_cap: '200',
+  handoff_words: 'موظف, شخص حقيقي, مدير, شكوى, اتصل بي',
+  handoff_reply: 'تم تحويل رسالتك إلى فريقنا وسيتواصل معك أحد المختصين في أقرب وقت 🌷',
 };
-const getFlow = async () => { const r = await q(`SELECT v FROM settings WHERE k='flow'`); return r[0] ? r[0].v : SEED; };
-const getSes = async (ch, c) => (await q(`SELECT * FROM bot_sessions WHERE channel=$1 AND contact=$2`, [ch, c]))[0] || { data: {}, node: null, paused: false };
-const setSes = (ch, c, name, node, data, paused) => q(
-  `INSERT INTO bot_sessions(channel,contact,name,node,data,paused) VALUES($1,$2,$3,$4,$5,$6)
-   ON CONFLICT(channel,contact) DO UPDATE SET name=COALESCE(NULLIF($3,''),bot_sessions.name), node=$4, data=$5, paused=$6`,
-  [ch, c, name || '', node, JSON.stringify(data), !!paused]);
 
-async function raw(ch, to, message, opts = {}) {
-  const recipient = opts.commentId ? { comment_id: opts.commentId } : { id: to };
-  const url = ch === 'fb' ? `${G}/me/messages` : `${G}/${FB.ig}/messages`;
-  const body = ch === 'fb' ? { recipient, messaging_type: 'RESPONSE', message } : { recipient, message };
-  const r = await api(url, body, FB.token);
-  if (opts.t && r.__ok === false) opts.t.fail = true;
-  return r;
+/* ---------- تحويل الصفوف للواجهة ---------- */
+
+function publicAccount(a) {
+  let extra = {};
+  try { extra = JSON.parse(a.extra || '{}'); } catch { /* تجاهل */ }
+  const b = baseUrl();
+  const webhook = a.channel === 'telegram' ? `${b}/webhook/telegram/${a.id}` : a.channel === 'tiktok' ? `${b}/webhook/tiktok/${a.id}` : `${b}/webhook/meta`;
+  return {
+    id: a.id, channel: a.channel, name: a.name, external_id: a.external_id, active: !!a.active, hasToken: !!a.token,
+    outbound_url: extra.outbound_url || '', hasOutboundSecret: !!extra.outbound_secret,
+    inboundSecret: a.channel === 'tiktok' ? extra.secret : undefined, webhook,
+  };
 }
-async function sendNode(ch, to, node, name, opts = {}) {
-  const text = (node.text || '').replace(/\{name\}/g, name || '').trim() || '.';
-  const btns = node.buttons || [], pb = btns.filter(b => !b.url), ub = btns.filter(b => b.url);
-  const urlTxt = ub.length ? '\n' + ub.map(b => `${b.title}: ${b.url}`).join('\n') : '';
-  if (ch === 'wa') {
-    const send1 = async m => { const r = await api(`${G}/${E.WA_PHONE_ID}/messages`, { messaging_product: 'whatsapp', to, ...m }, E.WA_TOKEN); if (opts.t && r.__ok === false) opts.t.fail = true; return r; };
-    if (node.image && (pb.length || !text)) await send1({ type: 'image', image: { link: node.image } });
-    if (pb.length && pb.length <= 3) await send1({ type: 'interactive', interactive: { type: 'button', body: { text: text + urlTxt }, action: { buttons: pb.map(b => ({ type: 'reply', reply: { id: 'go:' + b.to, title: b.title.slice(0, 20) } })) } } });
-    else if (pb.length) await send1({ type: 'interactive', interactive: { type: 'list', body: { text: text + urlTxt }, action: { button: 'اختر', sections: [{ title: 'القائمة', rows: pb.slice(0, 10).map(b => ({ id: 'go:' + b.to, title: b.title.slice(0, 24) })) }] } } });
-    else if (node.image) await send1({ type: 'image', image: { link: node.image, caption: text + urlTxt } });
-    else await send1({ type: 'text', text: { body: text + urlTxt } });
-  } else {
-    const img = () => node.image && raw(ch, to, { attachment: { type: 'image', payload: { url: node.image } } }, { t: opts.t });
-    let msg;
-    if (ch === 'fb' && ub.length && !pb.length) msg = { attachment: { type: 'template', payload: { template_type: 'button', text: text.slice(0, 640), buttons: ub.slice(0, 3).map(b => ({ type: 'web_url', url: b.url, title: b.title.slice(0, 20) })) } } };
-    else { msg = { text: text + urlTxt }; if (pb.length) msg.quick_replies = pb.slice(0, 13).map(b => ({ content_type: 'text', title: b.title.slice(0, 20), payload: 'go:' + b.to })); }
-    if (!opts.commentId) await img();
-    await raw(ch, to, msg, opts);
-    if (opts.commentId) await img();
-  }
-  await log(ch, to, name, 'out', text);
-  return !(opts.t && opts.t.fail);
+const publicCampaign = (c) => ({ ...c, active: !!c.active, once_per_user: !!c.once_per_user });
+
+function validateCampaign(b) {
+  const errs = [];
+  const name = String(b.name || '').trim();
+  if (!name) errs.push('اسم الحملة مطلوب');
+  const channel = b.channel === 'any' || CHANNELS[b.channel] ? b.channel : 'any';
+  const scope = b.scope === 'post' ? 'post' : 'all';
+  const post_id = String(b.post_id || '').trim();
+  if (scope === 'post' && !post_id) errs.push('معرّف المنشور مطلوب عند اختيار منشور محدد');
+  const mode = (v) => (['off', 'template', 'ai'].includes(v) ? v : 'ai');
+  const public_mode = mode(b.public_mode);
+  const dm_mode = mode(b.dm_mode);
+  if (public_mode === 'off' && dm_mode === 'off') errs.push('فعّل الرد العلني أو الرسالة الخاصة على الأقل');
+  const account_id = b.account_id ? Number(b.account_id) : null;
+  return {
+    errs,
+    v: {
+      name, channel, account_id, scope, post_id: scope === 'post' ? post_id : '', keywords: String(b.keywords || '').trim(),
+      public_mode, public_text: String(b.public_text || '').trim(), dm_mode, dm_text: String(b.dm_text || '').trim(),
+      dm_details: String(b.dm_details || '').trim(), once_per_user: b.once_per_user === false ? 0 : 1, active: b.active === false ? 0 : 1,
+    },
+  };
 }
-async function goNode(ch, c, name, id, opts = {}, depth = 0) {
-  const flow = await getFlow(), node = flow.nodes[id];
-  if (!node) return;
-  const ses = await getSes(ch, c);
-  await sendNode(ch, c, node, name, opts);
-  if (node.type === 'ask') return setSes(ch, c, name, id, ses.data, false);
-  if (node.type === 'handoff') return setSes(ch, c, name, null, ses.data, true);
-  await setSes(ch, c, name, null, ses.data, false);
-  if (node.type === 'end') {
-    const s = await getSettings();
-    await q(`INSERT INTO leads(channel,contact,name,answers) VALUES($1,$2,$3,$4)`, [ch, c, name || ses.name, JSON.stringify(ses.data)]);
-    await setSes(ch, c, name, null, {}, false);
-    if (s.notifyWhatsApp && E.WA_TOKEN) {
-      const body = `📥 عميل جديد (${ch}) ${name || ''}\n` + Object.entries(ses.data).map(([k, v]) => `${k}: ${v}`).join('\n');
-      await sendNode('wa', s.notifyWhatsApp, { text: body }, 'مدير');
+
+/* ---------- معالجة الأحداث الواردة (ويب هوك) ---------- */
+
+function dispatch(ev, account) {
+  const full = { ...ev, account };
+  const p = ev.kind === 'comment' ? processComment(full) : processMessage(full);
+  p.catch((e) => console.error('[engine]', e));
+}
+
+/* ---------- المسارات ---------- */
+
+async function handleWebhooks(req, res, url) {
+  if (url.pathname === '/webhook/meta') {
+    if (req.method === 'GET') {
+      const ok = url.searchParams.get('hub.mode') === 'subscribe' && safeEqual(url.searchParams.get('hub.verify_token') || '', getSetting('verify_token'));
+      return ok ? send(res, 200, url.searchParams.get('hub.challenge') || '') : send(res, 403, 'forbidden');
     }
-  } else if (node.next && !(node.buttons || []).length && depth < 10) await goNode(ch, c, name, node.next, {}, depth + 1);
-}
-const norm = x => (x || '').toLowerCase().trim();
-function kwMatch(k, text, type) {
-  const m = k.match || 'contains';
-  if (['image', 'sticker', 'audio'].includes(m)) return type === m;
-  const t = norm(text), words = (k.word || '').split(/[,،]/).map(norm).filter(Boolean);
-  return words.some(w => m === 'is' || m === 'resume' ? t === w : m === 'contains' ? t.includes(w) : m === 'word' ? t.split(/[\s،,.!?؟]+/).includes(w) : m === 'starts' ? t.startsWith(w) : false);
-}
-async function handleIncoming(ch, c, name, text, payload, type = 'text') {
-  await log(ch, c, name, 'in', text || payload || `[${type}]`);
-  await q(`INSERT INTO bot_users(channel,contact,name,phone,last_seen) VALUES($1,$2,$3,$4,now())
-           ON CONFLICT(channel,contact) DO UPDATE SET name=COALESCE(NULLIF($3,''),bot_users.name), last_seen=now()`, [ch, c, name || '', ch === 'wa' ? c : '']);
-  const flow = await getFlow(), ses = await getSes(ch, c);
-  if (payload && payload.startsWith('go:')) return goNode(ch, c, name, payload.slice(3));
-  const kws = (flow.keywords || []).filter(k => kwMatch(k, text, type));
-  if (ses.paused) {
-    const r = kws.find(k => k.match === 'resume');
-    if (!r && !/^(\/start|ابدأ|start)$/i.test(text || '')) return;
-    await setSes(ch, c, name, null, ses.data, false);
-    return goNode(ch, c, name, (r && r.node) || flow.start);
+    if (req.method === 'POST') {
+      const raw = await readBody(req);
+      const secret = process.env.APP_SECRET || getSetting('app_secret');
+      if (!verifySignature(raw, req.headers['x-hub-signature-256'], secret)) return send(res, 401, 'bad signature');
+      const body = parseJson(raw);
+      send(res, 200, 'EVENT_RECEIVED');
+      if (!body) return;
+      for (const ev of parseMeta(body)) {
+        const account = get('SELECT * FROM accounts WHERE channel = ? AND external_id = ? AND active = 1', ev.channel, String(ev.externalId));
+        if (account) dispatch(ev, account);
+      }
+      return;
+    }
   }
-  const n = ses.node && flow.nodes[ses.node];
-  if (n && n.type === 'ask' && type === 'text') {
-    await setSes(ch, c, name, null, { ...ses.data, [n.key || n.id]: text }, false);
-    return n.next ? goNode(ch, c, name, n.next) : undefined;
+  let m = url.pathname.match(/^\/webhook\/(telegram|tiktok)\/(\d+)$/);
+  if (m && req.method === 'POST') {
+    const account = get('SELECT * FROM accounts WHERE id = ? AND channel = ? AND active = 1', Number(m[2]), m[1]);
+    if (!account) return send(res, 404, 'not found');
+    let extra = {};
+    try { extra = JSON.parse(account.extra || '{}'); } catch { /* تجاهل */ }
+    const given = m[1] === 'telegram' ? req.headers['x-telegram-bot-api-secret-token'] : req.headers['x-webhook-secret'];
+    if (!extra.secret || !safeEqual(given || '', extra.secret)) return send(res, 401, 'unauthorized');
+    const body = parseJson(await readBody(req));
+    send(res, 200, 'ok');
+    if (!body) return;
+    const events = m[1] === 'telegram' ? parseTelegram(body) : parseTikTok(body);
+    for (const ev of events) dispatch(ev, account);
+    return;
   }
-  const kw = kws.find(k => k.match !== 'resume');
-  if (kw) return goNode(ch, c, name, kw.node || flow.start);
-  if (type === 'text') return goNode(ch, c, name, flow.fallback || flow.start);
+  return send(res, 404, 'not found');
 }
-async function handleComment(ch, commentId, userId, name, text, postId) {
-  const s = await getSettings();
-  await log(ch, userId, name, 'in', `💬 تعليق: ${text}`);
-  let liked = false, replied = false, dm = false;
-  if (ch === 'fb') {
-    if (s.autoLike) liked = !!(await api(`${G}/${commentId}/likes`, {}, FB.token)).__ok;
-    if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/comments`, { message: s.commentReply }, FB.token)).__ok;
-  } else if (s.autoPublicReply) replied = !!(await api(`${G}/${commentId}/replies`, { message: s.commentReply }, FB.token)).__ok;
-  if (s.autoPrivateReply) { const f = await getFlow(); await setSes(ch, userId, name, null, {}, false); const t = {}; await goNode(ch, userId, name, f.start, { commentId, t }); dm = !t.fail; }
-  await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,liked,replied,dm) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-           ON CONFLICT(channel,comment_id) DO UPDATE SET liked=comments.liked OR $7, replied=comments.replied OR $8, dm=comments.dm OR $9`,
-    [ch, commentId, postId || '', userId, name || '', (text || '').slice(0, 1000), liked, replied, dm]);
-}
-async function sendManual(ch, to, text) { await sendNode(ch, to, { text }, ''); await setSes(ch, to, '', null, (await getSes(ch, to)).data, true); }
 
-// ---------- Webhook ----------
-app.get('/webhook', (req, res) => {
-  if (req.query['hub.verify_token'] === E.VERIFY_TOKEN) return res.send(req.query['hub.challenge']);
-  res.sendStatus(403);
-});
-app.post('/webhook', (req, res) => {
-  res.sendStatus(200);
-  const b = req.body;
-  (async () => {
-    for (const en of b.entry || []) {
-      if (b.object === 'page' || b.object === 'instagram') {
-        const ch = b.object === 'page' ? 'fb' : 'ig';
-        for (const m of en.messaging || []) {
-          if (m.postback) await handleIncoming(ch, m.sender.id, '', m.postback.title, m.postback.payload);
-          else if (m.message && !m.message.is_echo) {
-            const at = m.message.attachments && m.message.attachments[0];
-            const type = m.message.sticker_id ? 'sticker' : at && ['image', 'audio'].includes(at.type) ? at.type : 'text';
-            await handleIncoming(ch, m.sender.id, '', m.message.text || '', m.message.quick_reply && m.message.quick_reply.payload, type);
-          }
-        }
-        for (const c of en.changes || []) {
-          const v = c.value || {};
-          if (ch === 'fb' && c.field === 'feed' && v.item === 'comment' && v.verb === 'add' && v.from && v.from.id !== en.id)
-            await handleComment('fb', v.comment_id, v.from.id, v.from.name, v.message || '', v.post_id);
-          if (ch === 'ig' && c.field === 'comments' && v.from && v.from.id !== en.id)
-            await handleComment('ig', v.id, v.from.id, v.from.username, v.text || '', v.media && v.media.id);
-        }
-      } else if (b.object === 'whatsapp_business_account') {
-        for (const c of en.changes || []) {
-          const v = c.value || {};
-          const nm = (v.contacts && v.contacts[0] && v.contacts[0].profile && v.contacts[0].profile.name) || '';
-          for (const m of v.messages || []) {
-            if (m.type === 'text') await handleIncoming('wa', m.from, nm, m.text.body);
-            else if (['image', 'sticker', 'audio'].includes(m.type)) await handleIncoming('wa', m.from, nm, '', null, m.type);
-            else if (m.type === 'interactive') { const r = m.interactive.button_reply || m.interactive.list_reply || {}; await handleIncoming('wa', m.from, nm, r.title, r.id); }
-          }
-        }
+async function handleApi(req, res, url) {
+  const p = url.pathname;
+  const method = req.method;
+
+  if (p === '/api/login' && method === 'POST') {
+    const ip = req.socket.remoteAddress || '';
+    const a = attempts.get(ip) || { n: 0, until: 0 };
+    if (a.until > Date.now()) return json(res, 429, { error: 'محاولات كثيرة. حاول بعد قليل.' });
+    const body = parseJson(await readBody(req)) || {};
+    if (!passwordOk(String(body.password || ''))) {
+      a.n += 1;
+      if (a.n >= 5) { a.until = Date.now() + 5 * 60_000; a.n = 0; }
+      attempts.set(ip, a);
+      return json(res, 401, { error: 'كلمة المرور غير صحيحة' });
+    }
+    attempts.delete(ip);
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    return json(res, 200, { ok: true }, { 'set-cookie': `sid=${newSession()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${secure}` });
+  }
+  if (p === '/api/logout' && method === 'POST') {
+    sessions.delete(cookies(req).sid);
+    return json(res, 200, { ok: true }, { 'set-cookie': 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
+  }
+  if (!authed(req)) return json(res, 401, { error: 'يلزم تسجيل الدخول' });
+
+  if (method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json')) {
+    return json(res, 415, { error: 'نوع المحتوى غير مدعوم' });
+  }
+  const body = method === 'GET' || method === 'DELETE' ? {} : parseJson(await readBody(req));
+  if (body === null) return json(res, 400, { error: 'JSON غير صالح' });
+
+  if (p === '/api/info' && method === 'GET') {
+    return json(res, 200, {
+      baseUrl: baseUrl(), metaWebhook: `${baseUrl()}/webhook/meta`, verifyToken: getSetting('verify_token'),
+      aiConfigured: aiConfigured(), appSecretSet: !!(process.env.APP_SECRET || getSetting('app_secret')),
+      passwordFromEnv: !!process.env.ADMIN_PASSWORD, channels: CHANNELS,
+    });
+  }
+
+  if (p === '/api/overview' && method === 'GET') {
+    const since = Date.now() - 14 * 86400_000;
+    const rows = all('SELECT ts, kind, status, public_status, dm_status FROM events WHERE simulated = 0 AND ts > ?', since);
+    const day = (ts) => Math.floor((ts + TZ) / 86400_000);
+    const today = day(Date.now());
+    const days = [];
+    for (let i = 13; i >= 0; i--) days.push({ d: today - i, comments: 0, messages: 0 });
+    const idx = new Map(days.map((x, i) => [x.d, i]));
+    const k = { comments: 0, messages: 0, publicSent: 0, dmSent: 0, failed: 0, handoff: 0 };
+    for (const r of rows) {
+      const i = idx.get(day(r.ts));
+      if (i !== undefined) days[i][r.kind === 'comment' ? 'comments' : 'messages'] += 1;
+      if (r.ts > Date.now() - 7 * 86400_000) {
+        if (r.kind === 'comment') k.comments += 1; else k.messages += 1;
+        if (r.public_status === 'sent') k.publicSent += 1;
+        if (r.dm_status === 'sent') k.dmSent += 1;
+        if (r.status === 'failed') k.failed += 1;
+        if (r.status === 'handoff') k.handoff += 1;
       }
     }
-  })().catch(e => console.error(e));
-});
+    const recent = all(`SELECT e.*, c.name AS campaign_name FROM events e LEFT JOIN campaigns c ON c.id = e.campaign_id WHERE e.simulated = 0 ORDER BY e.id DESC LIMIT 6`);
+    const counts = {
+      campaigns: get('SELECT COUNT(*) n FROM campaigns WHERE active = 1').n,
+      accounts: get('SELECT COUNT(*) n FROM accounts WHERE active = 1').n,
+    };
+    return json(res, 200, {
+      kpi: k, counts, days: days.map((x) => ({ date: new Date(x.d * 86400_000).toISOString().slice(5, 10), comments: x.comments, messages: x.messages })),
+      recent, aiConfigured: aiConfigured(), businessReady: !!getSetting('business_name') && !!getSetting('business_details'),
+    });
+  }
 
-// ---------- Admin API ----------
-const sign = d => crypto.createHmac('sha256', E.SECRET || 'x').update(d).digest('hex');
-const mkToken = (u, r) => { const p = Buffer.from(JSON.stringify({ u, r, e: Date.now() + 7 * 864e5 })).toString('base64url'); return p + '.' + sign(p); };
-function readToken(t) {
-  if (!t) return null; const [p, sg] = t.split('.');
-  if (!sg || sign(p) !== sg) return null;
-  try { const o = JSON.parse(Buffer.from(p, 'base64url')); return o.e > Date.now() ? o : null; } catch (e) { return null; }
-}
-const PERMS = ['inbox', 'users', 'leads', 'stats', 'subs', 'flow', 'broadcast', 'settings', 'admins'];
-const DEFAULT_AGENT = ['inbox', 'users', 'leads'];
-const auth = async (req, res, next) => {
-  try {
-    const u = readToken(req.headers['x-token'] || req.query.t); if (!u) return res.sendStatus(401);
-    req.user = u; req.perms = PERMS;
-    if (u.u !== 'admin' || u.r !== 'owner') {
-      const a = (await q(`SELECT role, perms FROM admins WHERE username=$1`, [u.u]))[0];
-      if (!a) return res.sendStatus(401);
-      req.user.r = a.role; req.perms = a.role === 'owner' ? PERMS : (a.perms || DEFAULT_AGENT);
-    }
-    next();
-  } catch (e) { res.sendStatus(500); }
-};
-const can = p => (req, res, next) => req.perms.includes(p) ? next() : res.sendStatus(403);
-const wrap = f => (req, res) => f(req, res).catch(e => { console.error(e); res.status(500).json({ error: e.message }); });
-const hash = (pw, salt = crypto.randomBytes(8).toString('hex')) => salt + ':' + crypto.scryptSync(pw, salt, 32).toString('hex');
-const fails = new Map();
-const tsEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
-app.post('/api/login', wrap(async (req, res) => {
-  const { username, password } = req.body || {};
-  const f = fails.get(req.ip) || { n: 0, t: Date.now() };
-  if (Date.now() - f.t > 15 * 60e3) { f.n = 0; f.t = Date.now(); }
-  if (f.n >= 10) return res.status(429).json({ error: 'محاولات كثيرة، حاول بعد 15 دقيقة' });
-  const bad = () => { f.n++; fails.set(req.ip, f); res.status(401).json({ error: 'bad login' }); };
-  if (E.ADMIN_PASSWORD && (username || 'admin') === 'admin' && tsEq(password || '', E.ADMIN_PASSWORD)) return res.json({ token: mkToken('admin', 'owner'), role: 'owner', perms: PERMS });
-  const a = (await q(`SELECT * FROM admins WHERE username=$1`, [username || '']))[0];
-  if (a && tsEq(hash(password || '', a.pass.split(':')[0]), a.pass)) return res.json({ token: mkToken(a.username, a.role), role: a.role, perms: a.role === 'owner' ? PERMS : (a.perms || DEFAULT_AGENT) });
-  bad();
-}));
-app.get('/api/admins', auth, can('admins'), wrap(async (req, res) => res.json((await q(`SELECT username, role, perms FROM admins ORDER BY username`)).map(a => ({ ...a, perms: a.role === 'owner' ? PERMS : (a.perms || DEFAULT_AGENT) })))));
-app.post('/api/admins', auth, can('admins'), wrap(async (req, res) => {
-  const { username, password, role } = req.body;
-  const perms = (req.body.perms || []).filter(p => PERMS.includes(p));
-  const r = role === 'owner' ? 'owner' : 'agent';
-  if (!username || username === 'admin') return res.status(400).json({ error: 'اسم مستخدم غير صالح (admin محجوز للمدير الأساسي)' });
-  const ex = (await q(`SELECT 1 FROM admins WHERE username=$1`, [username]))[0];
-  if (!password && ex) { await q(`UPDATE admins SET role=$2, perms=$3 WHERE username=$1`, [username, r, JSON.stringify(perms)]); return res.json({ ok: true }); }
-  if (!password || password.length < 6) return res.status(400).json({ error: 'كلمة المرور 6 أحرف فأكثر' });
-  await q(`INSERT INTO admins(username,pass,role,perms) VALUES($1,$2,$3,$4) ON CONFLICT(username) DO UPDATE SET pass=$2, role=$3, perms=$4`, [username, hash(password), r, JSON.stringify(perms)]);
-  res.json({ ok: true });
-}));
-app.delete('/api/admins/:u', auth, can('admins'), wrap(async (req, res) => { await q(`DELETE FROM admins WHERE username=$1`, [req.params.u]); res.json({ ok: true }); }));
-
-app.get('/api/conversations', auth, can('inbox'), wrap(async (req, res) => {
-  res.json(await q(`SELECT DISTINCT ON (channel,contact) channel, contact, name, text, dir, ts FROM messages ORDER BY channel, contact, ts DESC`)
-    .then(r => r.sort((a, b) => new Date(b.ts) - new Date(a.ts))));
-}));
-app.get('/api/messages', auth, can('inbox'), wrap(async (req, res) => {
-  res.json(await q(`SELECT dir,text,ts FROM messages WHERE channel=$1 AND contact=$2 ORDER BY ts`, [req.query.channel, req.query.contact]));
-}));
-app.post('/api/send', auth, can('inbox'), wrap(async (req, res) => {
-  const { channel, contact, text } = req.body;
-  await sendManual(channel, contact, text);
-  res.json({ ok: true });
-}));
-app.get('/api/settings', auth, can('settings'), wrap(async (req, res) => res.json(await getSettings())));
-app.put('/api/settings', auth, can('settings'), wrap(async (req, res) => {
-  await q(`INSERT INTO settings(k,v) VALUES('main',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify({
-    commentReply: String(req.body.commentReply || DEFAULTS.commentReply).slice(0, 500),
-    notifyWhatsApp: String(req.body.notifyWhatsApp || '').replace(/\D/g, ''),
-    autoLike: !!req.body.autoLike, autoPublicReply: !!req.body.autoPublicReply, autoPrivateReply: !!req.body.autoPrivateReply })]);
-  res.json({ ok: true });
-}));
-app.get('/api/flow', auth, can('flow'), wrap(async (req, res) => res.json(await getFlow())));
-app.put('/api/flow', auth, can('flow'), wrap(async (req, res) => {
-  await q(`INSERT INTO settings(k,v) VALUES('flow',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify(req.body)]);
-  res.json({ ok: true });
-}));
-app.post('/api/resume', auth, can('inbox'), wrap(async (req, res) => {
-  await q(`UPDATE bot_sessions SET paused=false WHERE channel=$1 AND contact=$2`, [req.body.channel, req.body.contact]);
-  res.json({ ok: true });
-}));
-app.get('/api/leads', auth, can('leads'), wrap(async (req, res) => res.json(await q(`SELECT * FROM leads ORDER BY ts DESC`))));
-app.get('/api/export.xlsx', auth, can('leads'), wrap(async (req, res) => {
-  const leads = await q(`SELECT * FROM leads ORDER BY ts DESC`);
-  const keys = [...new Set(leads.flatMap(l => Object.keys(l.answers || {})))];
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Leads', { views: [{ rightToLeft: true }] });
-  ws.columns = [{ header: 'التاريخ', width: 20 }, { header: 'القناة', width: 10 }, { header: 'الاسم', width: 20 }, ...keys.map(k => ({ header: k, width: 25 }))];
-  ws.getRow(1).font = { bold: true };
-  leads.forEach(l => ws.addRow([new Date(l.ts).toLocaleString('en-GB'), l.channel, l.name, ...keys.map(k => (l.answers || {})[k] || '')]));
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', 'attachment; filename=leads.xlsx');
-  await wb.xlsx.write(res); res.end();
-}));
-
-// ---------- Bot users ----------
-app.get('/api/users', auth, can('users'), wrap(async (req, res) => {
-  const page = Math.max(1, +req.query.page || 1), s = `%${req.query.search || ''}%`, ch = ['fb', 'ig', 'wa'].includes(req.query.channel) ? req.query.channel : '';
-  const W = `(name ILIKE $1 OR phone ILIKE $1 OR contact ILIKE $1) AND ($2='' OR channel=$2)`;
-  const rows = await q(`SELECT channel,contact,name,phone,last_seen FROM bot_users WHERE ${W} ORDER BY last_seen DESC NULLS LAST, created DESC LIMIT 20 OFFSET $3`, [s, ch, (page - 1) * 20]);
-  const t = await q(`SELECT count(*)::int n FROM bot_users WHERE ${W}`, [s, ch]);
-  res.json({ rows, total: t[0].n });
-}));
-app.post('/api/users/import', auth, can('users'), wrap(async (req, res) => {
-  const us = (req.body.users || []).map(u => ({ ch: ['fb', 'ig', 'wa'].includes(u.channel) ? u.channel : 'wa', n: String(u.name || ''), p: String(u.phone || '').replace(/\D/g, '') })).filter(u => u.p);
-  if (us.length) await q(`INSERT INTO bot_users(channel,contact,name,phone) SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::text[]) ON CONFLICT(channel,contact) DO UPDATE SET name=COALESCE(NULLIF(EXCLUDED.name,''),bot_users.name)`,
-    [us.map(u => u.ch), us.map(u => u.p), us.map(u => u.n), us.map(u => u.p)]);
-  res.json({ imported: us.length });
-}));
-app.delete('/api/users/:ch/:contact', auth, can('users'), wrap(async (req, res) => {
-  const a = [req.params.ch, req.params.contact];
-  for (const t of ['bot_users', 'bot_sessions', 'messages']) await q(`DELETE FROM ${t} WHERE channel=$1 AND contact=$2`, a);
-  res.json({ ok: true });
-}));
-app.get('/api/users.csv', auth, can('users'), wrap(async (req, res) => {
-  const rows = await q(`SELECT name,phone,channel,contact,last_seen FROM bot_users ORDER BY created`);
-  const c = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8'); res.setHeader('Content-Disposition', 'attachment; filename=users.csv');
-  res.send('\ufeffname,phone,channel,contact,last_seen\n' + rows.map(r => [r.name, r.phone, r.channel, r.contact, r.last_seen].map(c).join(',')).join('\n'));
-}));
-
-// ---------- Broadcasts ----------
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function runBroadcast(id, b) {
-  try {
-    const flow = await getFlow(), node = flow.nodes[b.node];
-    const tpl = b.channel === 'wa' && b.template;
-    const users = await q(`SELECT contact,name FROM bot_users WHERE channel=$1 ${tpl ? '' : "AND last_seen > now() - interval '24 hours'"}`, [b.channel]);
-    await q(`UPDATE broadcasts SET total=$2 WHERE id=$1`, [id, users.length]);
-    let sent = 0, failed = 0;
-    for (const u of users) {
-      let ok = false;
-      try {
-        if (tpl) { const r = await api(`${G}/${E.WA_PHONE_ID}/messages`, { messaging_product: 'whatsapp', to: u.contact, type: 'template', template: { name: b.template, language: { code: b.lang || 'ar' } } }, E.WA_TOKEN); ok = r.__ok; if (ok) await log('wa', u.contact, u.name, 'out', `📢 قالب: ${b.template}`); }
-        else if (node) ok = await sendNode(b.channel, u.contact, node, u.name, { t: {} });
-      } catch (e) { ok = false; }
-      ok ? sent++ : failed++;
-      if ((sent + failed) % 20 === 0) await q(`UPDATE broadcasts SET sent=$2, failed=$3 WHERE id=$1`, [id, sent, failed]);
-      await sleep(60);
-    }
-    await q(`UPDATE broadcasts SET sent=$2, failed=$3, status='done' WHERE id=$1`, [id, sent, failed]);
-  } catch (e) { console.error(e); await q(`UPDATE broadcasts SET status='error' WHERE id=$1`, [id]); }
-}
-app.get('/api/broadcasts', auth, can('broadcast'), wrap(async (req, res) => res.json(await q(`SELECT * FROM broadcasts ORDER BY id DESC LIMIT 30`))));
-app.post('/api/broadcast', auth, can('broadcast'), wrap(async (req, res) => {
-  const b = req.body;
-  if (!['fb', 'ig', 'wa'].includes(b.channel) || (!b.node && !b.template)) return res.status(400).json({ error: 'بيانات ناقصة' });
-  const r = await q(`INSERT INTO broadcasts(name,channel,node,template,status) VALUES($1,$2,$3,$4,'running') RETURNING id`, [b.name || 'بث', b.channel, b.node || '', b.template || '']);
-  runBroadcast(r[0].id, b);
-  res.json({ id: r[0].id });
-}));
-
-// ---------- Statistics ----------
-app.get('/api/stats', auth, can('stats'), wrap(async (req, res) => {
-  const one = async (sql, p) => (await q(sql, p))[0];
-  const days = `generate_series(current_date - 13, current_date, '1 day')::date`;
-  const [u, byCh, msgs, newU, leadsD, leadsT, subs, rev, bc] = await Promise.all([
-    one(`SELECT count(*)::int total, count(*) FILTER (WHERE last_seen > now() - interval '24 hours')::int d1, count(*) FILTER (WHERE last_seen > now() - interval '7 days')::int d7, count(*) FILTER (WHERE last_seen > now() - interval '30 days')::int d30 FROM bot_users`),
-    q(`SELECT channel, count(*)::int n FROM bot_users GROUP BY channel`),
-    q(`SELECT d::text day, count(m.*) FILTER (WHERE dir='in')::int inn, count(m.*) FILTER (WHERE dir='out')::int out FROM ${days} d LEFT JOIN messages m ON m.ts::date = d GROUP BY d ORDER BY d`),
-    q(`SELECT d::text day, count(b.*)::int n FROM ${days} d LEFT JOIN bot_users b ON b.created::date = d GROUP BY d ORDER BY d`),
-    q(`SELECT d::text day, count(l.*)::int n FROM ${days} d LEFT JOIN leads l ON l.ts::date = d GROUP BY d ORDER BY d`),
-    one(`SELECT count(*)::int total FROM leads`),
-    one(`WITH last AS (SELECT DISTINCT ON (channel,contact) * FROM subs ORDER BY channel, contact, end_at DESC)
-         SELECT count(*) FILTER (WHERE status<>'cancelled' AND end_at > now())::int active,
-                count(*) FILTER (WHERE status<>'cancelled' AND end_at > now() AND end_at < now() + interval '7 days')::int expiring,
-                count(*) FILTER (WHERE status<>'cancelled' AND end_at <= now())::int expired FROM last`),
-    one(`SELECT COALESCE(sum(price) FILTER (WHERE status<>'cancelled' AND start_at >= date_trunc('month', now())),0)::float month, COALESCE(sum(price) FILTER (WHERE status<>'cancelled'),0)::float total FROM subs`),
-    one(`SELECT count(*)::int n, COALESCE(sum(sent),0)::int sent FROM broadcasts`)
-  ]);
-  res.json({ users: u, byChannel: byCh, messages: msgs, newUsers: newU, leadsPerDay: leadsD, leads: leadsT.total, subs, revenue: rev, broadcasts: bc });
-}));
-
-// ---------- Subscriptions ----------
-app.get('/api/plans', auth, can('subs'), wrap(async (req, res) => res.json(await q(`SELECT * FROM plans ORDER BY id`))));
-app.post('/api/plans', auth, can('subs'), wrap(async (req, res) => {
-  const { id, name, price, days } = req.body;
-  if (!name || !(+days > 0)) return res.status(400).json({ error: 'الاسم والمدة مطلوبان' });
-  if (id) await q(`UPDATE plans SET name=$2, price=$3, days=$4 WHERE id=$1`, [id, name, +price || 0, +days]);
-  else await q(`INSERT INTO plans(name,price,days) VALUES($1,$2,$3)`, [name, +price || 0, +days]);
-  res.json({ ok: true });
-}));
-app.delete('/api/plans/:id', auth, can('subs'), wrap(async (req, res) => { await q(`DELETE FROM plans WHERE id=$1`, [req.params.id]); res.json({ ok: true }); }));
-app.get('/api/subs', auth, can('subs'), wrap(async (req, res) => {
-  const f = req.query.filter || 'all', s = `%${req.query.search || ''}%`;
-  const rows = await q(`SELECT * FROM (
-      SELECT DISTINCT ON (channel,contact) id, channel, contact, name, plan_name, price, start_at, end_at,
-        CASE WHEN status='cancelled' THEN 'cancelled' WHEN end_at < now() THEN 'expired' WHEN end_at < now() + interval '7 days' THEN 'expiring' ELSE 'active' END st
-      FROM subs WHERE name ILIKE $1 OR contact ILIKE $1 ORDER BY channel, contact, end_at DESC) t
-    WHERE ($2='all' OR st=$2) ORDER BY end_at LIMIT 100`, [s, f]);
-  res.json(rows);
-}));
-app.post('/api/subs', auth, can('subs'), wrap(async (req, res) => {
-  const channel = ['fb', 'ig', 'wa'].includes(req.body.channel) ? req.body.channel : 'wa';
-  const contact = String(req.body.phone || req.body.contact || '').replace(channel === 'wa' ? /\D/g : /\s/g, '');
-  const plan = (await q(`SELECT * FROM plans WHERE id=$1`, [req.body.planId]))[0];
-  if (!contact || !plan) return res.status(400).json({ error: 'الرقم والباقة مطلوبان' });
-  const u = (await q(`SELECT name FROM bot_users WHERE channel=$1 AND contact=$2`, [channel, contact]))[0];
-  const name = (u && u.name) || req.body.name || '';
-  if (!u) await q(`INSERT INTO bot_users(channel,contact,name,phone) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [channel, contact, name, channel === 'wa' ? contact : '']);
-  const last = (await q(`SELECT end_at FROM subs WHERE channel=$1 AND contact=$2 AND status<>'cancelled' ORDER BY end_at DESC LIMIT 1`, [channel, contact]))[0];
-  const start = last && new Date(last.end_at) > new Date() ? new Date(last.end_at) : new Date();
-  const end = new Date(start.getTime() + (+req.body.days || plan.days) * 864e5);
-  await q(`INSERT INTO subs(channel,contact,name,plan_id,plan_name,price,start_at,end_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [channel, contact, name, plan.id, plan.name, plan.price, start, end]);
-  res.json({ ok: true, end });
-}));
-app.post('/api/subs/:id/cancel', auth, can('subs'), wrap(async (req, res) => { await q(`UPDATE subs SET status='cancelled' WHERE id=$1`, [req.params.id]); res.json({ ok: true }); }));
-
-// ---------- Comments panel (reply / like as the page) ----------
-app.get('/api/comments', auth, can('inbox'), wrap(async (req, res) => {
-  const ch = ['fb', 'ig'].includes(req.query.channel) ? req.query.channel : '';
-  res.json(await q(`SELECT id,channel,post_id,user_id,name,text,ts,liked,replied,dm FROM comments WHERE ($1='' OR channel=$1) ORDER BY ts DESC LIMIT 100`, [ch]));
-}));
-const getComment = async id => (await q(`SELECT * FROM comments WHERE id=$1`, [id]))[0];
-app.post('/api/comments/:id/like', auth, can('inbox'), wrap(async (req, res) => {
-  const c = await getComment(req.params.id); if (!c) return res.status(404).json({ error: 'غير موجود' });
-  if (c.channel !== 'fb') return res.status(400).json({ error: 'الإعجاب بالتعليق متاح لفيسبوك فقط' });
-  const r = await api(`${G}/${c.comment_id}/likes`, {}, FB.token);
-  if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الإعجاب' });
-  await q(`UPDATE comments SET liked=true WHERE id=$1`, [c.id]); res.json({ ok: true });
-}));
-app.post('/api/comments/:id/reply', auth, can('inbox'), wrap(async (req, res) => {
-  const c = await getComment(req.params.id), text = String(req.body.text || '').trim();
-  if (!c || !text) return res.status(400).json({ error: 'نص الرد مطلوب' });
-  const r = await api(c.channel === 'fb' ? `${G}/${c.comment_id}/comments` : `${G}/${c.comment_id}/replies`, { message: text }, FB.token);
-  if (!r.__ok) return res.status(400).json({ error: (r.error && r.error.message) || 'فشل الرد' });
-  await q(`UPDATE comments SET replied=true WHERE id=$1`, [c.id]); res.json({ ok: true });
-}));
-app.post('/api/comments/:id/dm', auth, can('inbox'), wrap(async (req, res) => {
-  const c = await getComment(req.params.id), text = String(req.body.text || '').trim();
-  if (!c || !text) return res.status(400).json({ error: 'نص الرسالة مطلوب' });
-  const t = {}; await sendNode(c.channel, c.user_id, { text }, c.name, { commentId: c.comment_id, t });
-  if (t.fail) return res.status(400).json({ error: 'تعذر إرسال الرسالة (التعليق أقدم من 7 أيام أو سبق الرد عليه خاصاً)' });
-  await q(`UPDATE comments SET dm=true WHERE id=$1`, [c.id]); res.json({ ok: true });
-}));
-// pull latest comments of recent posts (for comments that arrived while the server was asleep)
-app.post('/api/comments/sync', auth, can('inbox'), wrap(async (req, res) => {
-  const ig = req.body.channel === 'ig', ch = ig ? 'ig' : 'fb';
-  const me = ig ? FB.ig : (await gget(`${G}/me?fields=id`, FB.token)).id;
-  const posts = (await gget(ig ? `${G}/${FB.ig}/media?fields=id&limit=10` : `${G}/me/posts?fields=id&limit=10`, FB.token)).data || [];
-  let n = 0;
-  for (const p of posts) {
-    const j = await gget(ig ? `${G}/${p.id}/comments?fields=id,text,username,from,timestamp&limit=50` : `${G}/${p.id}/comments?fields=id,message,from{id,name},created_time&limit=50`, FB.token);
-    for (const c of j.data || []) {
-      const uid = c.from && c.from.id; if (!uid || uid === me) continue;
-      const r = await q(`INSERT INTO comments(channel,comment_id,post_id,user_id,name,text,ts) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel,comment_id) DO NOTHING RETURNING id`,
-        [ch, c.id, p.id, uid, ig ? (c.username || '') : c.from.name, (c.message || c.text || '').slice(0, 1000), c.created_time || c.timestamp]);
-      n += r.length;
+  /* الحملات */
+  if (p === '/api/campaigns' && method === 'GET') return json(res, 200, all('SELECT * FROM campaigns ORDER BY id DESC').map(publicCampaign));
+  if (p === '/api/campaigns' && method === 'POST') {
+    const { errs, v } = validateCampaign(body);
+    if (errs.length) return json(res, 400, { error: errs.join('، ') });
+    const r = run(
+      `INSERT INTO campaigns(name,channel,account_id,scope,post_id,keywords,public_mode,public_text,dm_mode,dm_text,dm_details,once_per_user,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      v.name, v.channel, v.account_id, v.scope, v.post_id, v.keywords, v.public_mode, v.public_text, v.dm_mode, v.dm_text, v.dm_details, v.once_per_user, v.active, Date.now(),
+    );
+    return json(res, 201, publicCampaign(get('SELECT * FROM campaigns WHERE id = ?', r.lastInsertRowid)));
+  }
+  let m = p.match(/^\/api\/campaigns\/(\d+)$/);
+  if (m) {
+    const id = Number(m[1]);
+    if (!get('SELECT 1 x FROM campaigns WHERE id = ?', id)) return json(res, 404, { error: 'الحملة غير موجودة' });
+    if (method === 'DELETE') { run('DELETE FROM campaigns WHERE id = ?', id); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      const cur = get('SELECT * FROM campaigns WHERE id = ?', id);
+      const { errs, v } = validateCampaign({ ...cur, ...body });
+      if (errs.length) return json(res, 400, { error: errs.join('، ') });
+      run(
+        `UPDATE campaigns SET name=?,channel=?,account_id=?,scope=?,post_id=?,keywords=?,public_mode=?,public_text=?,dm_mode=?,dm_text=?,dm_details=?,once_per_user=?,active=? WHERE id=?`,
+        v.name, v.channel, v.account_id, v.scope, v.post_id, v.keywords, v.public_mode, v.public_text, v.dm_mode, v.dm_text, v.dm_details, v.once_per_user, v.active, id,
+      );
+      return json(res, 200, publicCampaign(get('SELECT * FROM campaigns WHERE id = ?', id)));
     }
   }
-  res.json({ added: n });
-}));
 
-// ---------- Connect Facebook (OAuth: one click, no manual tokens) ----------
-const origin = req => (E.BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-const SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata,pages_manage_engagement,pages_read_engagement,instagram_basic,instagram_manage_messages,instagram_manage_comments';
-const getJson = async url => { const r = await fetch(url); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error((j.error && j.error.message) || 'Facebook error'); return j; };
-app.get('/auth/facebook', auth, can('settings'), (req, res) => {
-  if (!E.FB_APP_ID || !E.FB_APP_SECRET) return res.status(400).send('أضف FB_APP_ID و FB_APP_SECRET في متغيرات Render أولاً');
-  const state = mkToken(req.user.u, 'fb');
-  res.redirect(`https://www.facebook.com/v21.0/dialog/oauth?client_id=${E.FB_APP_ID}&redirect_uri=${encodeURIComponent(origin(req) + '/auth/facebook/callback')}&state=${state}&scope=${SCOPES}`);
-});
-const done = (res, ok, msg) => res.send(`<!doctype html><meta charset=utf-8><body style="font-family:sans-serif;text-align:center;padding:40px" dir=rtl><h3>${ok ? '✅ تم' : '❌ فشل'}</h3><p>${String(msg).replace(/[<>&]/g, '')}</p><script>try{opener.postMessage('fb-done',location.origin)}catch(e){}${ok ? 'setTimeout(()=>close(),1200)' : ''}</script>`);
-app.get('/auth/facebook/callback', wrap(async (req, res) => {
-  const st = readToken(req.query.state);
-  if (!st || st.r !== 'fb') return done(res, false, 'جلسة غير صالحة، أعد المحاولة');
-  if (req.query.error || !req.query.code) return done(res, false, 'تم إلغاء الربط');
-  try {
-    const redirect = encodeURIComponent(origin(req) + '/auth/facebook/callback');
-    const t1 = await getJson(`${G}/oauth/access_token?client_id=${E.FB_APP_ID}&client_secret=${E.FB_APP_SECRET}&redirect_uri=${redirect}&code=${encodeURIComponent(req.query.code)}`);
-    const t2 = await getJson(`${G}/oauth/access_token?grant_type=fb_exchange_token&client_id=${E.FB_APP_ID}&client_secret=${E.FB_APP_SECRET}&fb_exchange_token=${t1.access_token}`);
-    const pg = await getJson(`${G}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&limit=100&access_token=${t2.access_token}`);
-    const pages = (pg.data || []).map(p => ({ id: p.id, name: p.name, token: p.access_token, ig: p.instagram_business_account && p.instagram_business_account.id || '', igName: p.instagram_business_account && p.instagram_business_account.username || '' }));
-    if (!pages.length) return done(res, false, 'لم تُمنح صلاحية أي صفحة. أعد الربط واختر صفحتك');
-    await q(`INSERT INTO settings(k,v) VALUES('fb_pending',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify(pages)]);
-    done(res, true, 'ارجع للوحة واختر الصفحة');
-  } catch (e) { console.error(e); done(res, false, e.message); }
-}));
-app.get('/api/fb/status', auth, can('settings'), wrap(async (req, res) => {
-  const pend = (await q(`SELECT v FROM settings WHERE k='fb_pending'`))[0];
-  res.json({ appReady: !!(E.FB_APP_ID && E.FB_APP_SECRET), connected: !!FB.token, source: FB.source, pageId: FB.pageId, name: FB.name, ig: FB.ig, igName: FB.igName,
-    pending: pend ? pend.v.map(p => ({ id: p.id, name: p.name, igName: p.igName })) : [], redirect: origin(req) + '/auth/facebook/callback', webhook: origin(req) + '/webhook' });
-}));
-app.post('/api/fb/select', auth, can('settings'), wrap(async (req, res) => {
-  const pend = (await q(`SELECT v FROM settings WHERE k='fb_pending'`))[0], p = pend && pend.v.find(x => x.id === req.body.id);
-  if (!p) return res.status(400).json({ error: 'أعد الربط من جديد' });
-  const sub = await api(`${G}/${p.id}/subscribed_apps`, { subscribed_fields: ['messages', 'messaging_postbacks', 'feed'] }, p.token);
-  if (!sub.__ok) return res.status(400).json({ error: (sub.error && sub.error.message) || 'تعذر تفعيل استقبال الرسائل والتعليقات' });
-  const v = { token: p.token, ig: p.ig, pageId: p.id, name: p.name, igName: p.igName };
-  await q(`INSERT INTO settings(k,v) VALUES('fb',$1) ON CONFLICT(k) DO UPDATE SET v=$1`, [JSON.stringify(v)]);
-  await q(`DELETE FROM settings WHERE k='fb_pending'`);
-  Object.assign(FB, v, { source: 'db' });
-  res.json({ ok: true });
-}));
-app.post('/api/fb/disconnect', auth, can('settings'), wrap(async (req, res) => {
-  if (FB.pageId) await fetch(`${G}/${FB.pageId}/subscribed_apps?access_token=${FB.token}`, { method: 'DELETE' }).catch(() => {});
-  await q(`DELETE FROM settings WHERE k IN ('fb','fb_pending')`);
-  Object.assign(FB, { token: E.FB_PAGE_TOKEN, ig: E.IG_USER_ID, pageId: '', name: '', igName: '', source: E.FB_PAGE_TOKEN ? 'env' : 'none' });
-  res.json({ ok: true });
-}));
-
-// ---------- Post commenters (official API, own page/account only) ----------
-const gget = async (url, token) => {
-  const r = await fetch(url + (url.includes('access_token=') ? '' : (url.includes('?') ? '&' : '?') + 'access_token=' + token));
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((j.error && j.error.message) || 'Graph error');
-  return j;
-};
-app.get('/api/posts', auth, can('broadcast'), wrap(async (req, res) => {
-  const ig = req.query.channel === 'ig';
-  const j = await gget(ig ? `${G}/${FB.ig}/media?fields=id,caption,timestamp&limit=20` : `${G}/me/posts?fields=id,message,created_time&limit=20`, FB.token);
-  res.json((j.data || []).map(p => ({ id: p.id, text: (p.message || p.caption || '').slice(0, 80), ts: p.created_time || p.timestamp })));
-}));
-app.post('/api/harvest', auth, can('broadcast'), wrap(async (req, res) => {
-  const { channel, postId } = req.body, ig = channel === 'ig';
-  let url = ig ? `${G}/${postId}/comments?fields=id,text,username,from,timestamp&limit=100` : `${G}/${postId}/comments?fields=id,message,from{id,name},created_time&limit=100`, n = 0;
-  for (let i = 0; i < 50 && url; i++) {
-    const j = await gget(url, FB.token);
-    for (const c of j.data || []) {
-      const uid = c.from && c.from.id; if (!uid) continue;
-      const name = ig ? (c.username || c.from.username || '') : c.from.name;
-      await q(`INSERT INTO harvest(channel,post_id,comment_id,user_id,name,text,commented_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel,comment_id) DO NOTHING`,
-        [channel, postId, c.id, uid, name || '', (c.message || c.text || '').slice(0, 500), c.created_time || c.timestamp]);
-      await q(`INSERT INTO bot_users(channel,contact,name,phone) VALUES($1,$2,$3,'') ON CONFLICT DO NOTHING`, [channel, uid, name || '']);
-      n++;
+  /* الحسابات */
+  if (p === '/api/accounts' && method === 'GET') return json(res, 200, all('SELECT * FROM accounts ORDER BY id DESC').map(publicAccount));
+  if (p === '/api/accounts' && method === 'POST') {
+    if (!CHANNELS[body.channel]) return json(res, 400, { error: 'قناة غير معروفة' });
+    const name = String(body.name || '').trim();
+    if (!name) return json(res, 400, { error: 'اسم الحساب مطلوب' });
+    const extra = { secret: crypto.randomBytes(24).toString('hex') };
+    if (body.channel === 'tiktok') {
+      extra.outbound_url = String(body.outbound_url || '').trim();
+      if (body.outbound_secret) extra.outbound_secret = String(body.outbound_secret);
     }
-    url = j.paging && j.paging.next;
+    const r = run('INSERT INTO accounts(channel,name,external_id,token,extra,active,created_at) VALUES(?,?,?,?,?,1,?)', body.channel, name, String(body.external_id || '').trim(), String(body.token || '').trim(), JSON.stringify(extra), Date.now());
+    return json(res, 201, publicAccount(get('SELECT * FROM accounts WHERE id = ?', r.lastInsertRowid)));
   }
-  res.json({ collected: n });
-}));
-app.get('/api/harvest', auth, can('broadcast'), wrap(async (req, res) => res.json(await q(`SELECT name,user_id,text,sent,commented_at FROM harvest WHERE channel=$1 AND post_id=$2 ORDER BY commented_at DESC`, [req.query.channel, req.query.postId]))));
-app.get('/api/harvest.csv', auth, can('broadcast'), wrap(async (req, res) => {
-  const rows = await q(`SELECT name,user_id,text,commented_at FROM harvest WHERE channel=$1 AND post_id=$2 ORDER BY commented_at`, [req.query.channel, req.query.postId]);
-  const c = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8'); res.setHeader('Content-Disposition', 'attachment; filename=commenters.csv');
-  res.send('\ufeffname,user_id,comment,date\n' + rows.map(r => [r.name, r.user_id, r.text, r.commented_at].map(c).join(',')).join('\n'));
-}));
-// one private reply per comment, only comments younger than 7 days (Meta's rule)
-app.post('/api/harvest/send', auth, can('broadcast'), wrap(async (req, res) => {
-  const { channel, postId, node } = req.body, flow = await getFlow(), nd = flow.nodes[node];
-  if (!nd) return res.status(400).json({ error: 'العقدة غير موجودة' });
-  const rows = await q(`SELECT id,comment_id,user_id,name FROM harvest WHERE channel=$1 AND post_id=$2 AND NOT sent AND commented_at > now() - interval '7 days'`, [channel, postId]);
-  res.json({ queued: rows.length });
-  (async () => {
-    for (const r of rows) {
-      try {
-        if (await sendNode(channel, r.user_id, nd, r.name, { commentId: r.comment_id, t: {} })) {
-          await q(`UPDATE harvest SET sent=true WHERE id=$1`, [r.id]);
-          if (nd.type === 'ask') await setSes(channel, r.user_id, r.name, node, {}, false);
-        }
-      } catch (e) { console.error(e); }
-      await sleep(150);
+  m = p.match(/^\/api\/accounts\/(\d+)(\/telegram-webhook)?$/);
+  if (m) {
+    const id = Number(m[1]);
+    const acc = get('SELECT * FROM accounts WHERE id = ?', id);
+    if (!acc) return json(res, 404, { error: 'الحساب غير موجود' });
+    if (m[2] && method === 'POST') {
+      if (acc.channel !== 'telegram') return json(res, 400, { error: 'هذا الإجراء لحسابات تيليغرام فقط' });
+      if (!acc.token) return json(res, 400, { error: 'أدخل توكن البوت أولاً' });
+      if (!baseUrl().startsWith('https://')) return json(res, 400, { error: 'تيليغرام يتطلب عنوان HTTPS عاماً. اضبط PUBLIC_URL أو "العنوان العام" في الإعدادات.' });
+      const extra = JSON.parse(acc.extra || '{}');
+      const r = await setWebhook(acc.token, `${baseUrl()}/webhook/telegram/${id}`, extra.secret);
+      return r.ok ? json(res, 200, { ok: true }) : json(res, 502, { error: `رفض تيليغرام الطلب: ${r.error}` });
     }
-  })();
-}));
+    if (method === 'DELETE') { run('DELETE FROM accounts WHERE id = ?', id); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      const extra = JSON.parse(acc.extra || '{}');
+      if (acc.channel === 'tiktok') {
+        if (body.outbound_url !== undefined) extra.outbound_url = String(body.outbound_url).trim();
+        if (body.outbound_secret) extra.outbound_secret = String(body.outbound_secret);
+      }
+      run('UPDATE accounts SET name=?, external_id=?, token=?, extra=?, active=? WHERE id=?',
+        String(body.name ?? acc.name).trim() || acc.name,
+        body.external_id !== undefined ? String(body.external_id).trim() : acc.external_id,
+        body.token ? String(body.token).trim() : acc.token,
+        JSON.stringify(extra), body.active === false ? 0 : 1, id);
+      return json(res, 200, publicAccount(get('SELECT * FROM accounts WHERE id = ?', id)));
+    }
+  }
 
-init().then(() => app.listen(E.PORT || 3000, () => console.log('running'))).catch(e => { console.error('init failed', e); process.exit(1); });
+  /* الإعدادات */
+  if (p === '/api/settings' && method === 'GET') {
+    const out = {};
+    for (const k of SETTING_KEYS) {
+      if (SECRET_KEYS.includes(k)) out[`${k}_set`] = !!getSetting(k);
+      else out[k] = getSetting(k, DEFAULTS[k] ?? '');
+    }
+    return json(res, 200, out);
+  }
+  if (p === '/api/settings' && method === 'PUT') {
+    for (const k of SETTING_KEYS) {
+      if (body[k] === undefined) continue;
+      if (SECRET_KEYS.includes(k) && body[k] === '') continue; // الحقل الفارغ = لا تغيير
+      setSetting(k, String(body[k]).slice(0, 8000));
+    }
+    if (body.clear_ai_key) setSetting('ai_key', '');
+    return json(res, 200, { ok: true });
+  }
+  if (p === '/api/password' && method === 'PUT') {
+    if (process.env.ADMIN_PASSWORD) return json(res, 400, { error: 'كلمة المرور مضبوطة من متغير البيئة ADMIN_PASSWORD' });
+    if (!passwordOk(String(body.current || ''))) return json(res, 401, { error: 'كلمة المرور الحالية غير صحيحة' });
+    const next = String(body.next || '');
+    if (next.length < 8) return json(res, 400, { error: 'كلمة المرور الجديدة يجب ألا تقل عن 8 أحرف' });
+    setSetting('admin_hash', hashPassword(next));
+    return json(res, 200, { ok: true });
+  }
+
+  /* السجل */
+  if (p === '/api/events' && method === 'GET') {
+    const limit = Math.min(Number(url.searchParams.get('limit')) || 100, 500);
+    const where = [];
+    const params = [];
+    const kind = url.searchParams.get('kind');
+    const status = url.searchParams.get('status');
+    if (kind === 'comment' || kind === 'message') { where.push('e.kind = ?'); params.push(kind); }
+    if (status) { where.push('e.status = ?'); params.push(status); }
+    const rows = all(
+      `SELECT e.*, c.name AS campaign_name, a.name AS account_name FROM events e
+       LEFT JOIN campaigns c ON c.id = e.campaign_id LEFT JOIN accounts a ON a.id = e.account_id
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.id DESC LIMIT ?`, ...params, limit);
+    return json(res, 200, rows);
+  }
+
+  /* المحاكاة */
+  if (p === '/api/simulate' && method === 'POST') {
+    const text = String(body.text || '').trim();
+    if (!text) return json(res, 400, { error: 'اكتب نص التعليق أو الرسالة' });
+    const ev = {
+      channel: CHANNELS[body.channel] ? body.channel : 'facebook', postId: String(body.post_id || '').trim(), commentId: '',
+      userId: `sim-${crypto.randomBytes(4).toString('hex')}`, userName: String(body.user_name || 'أحمد').trim(), text, account: null,
+    };
+    const result = body.kind === 'message' ? await processMessage(ev, { simulate: true }) : await processComment(ev, { simulate: true });
+    return json(res, 200, { ...result, aiConfigured: aiConfigured() });
+  }
+
+  return json(res, 404, { error: 'غير موجود' });
+}
+
+/* ---------- الملفات الثابتة ---------- */
+
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
+function serveStatic(req, res, url) {
+  let rel = decodeURIComponent(url.pathname);
+  if (rel === '/') rel = '/index.html';
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!file.startsWith(PUBLIC_DIR + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, 'not found');
+  send(res, 200, fs.readFileSync(file), { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-cache' });
+}
+
+export const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/webhook/')) return await handleWebhooks(req, res, url);
+    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (req.method !== 'GET') return send(res, 405, 'method not allowed');
+    return serveStatic(req, res, url);
+  } catch (e) {
+    console.error('[server]', e);
+    if (!res.headersSent) json(res, e.status || 500, { error: e.status === 413 ? e.message : 'خطأ داخلي في الخادم' });
+  }
+});
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  server.listen(PORT, () => console.log(`ReplyFlow يعمل على المنفذ ${PORT} — ${baseUrl()}`));
+}

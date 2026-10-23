@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: replyflow
+    runtime: node
+    plan: starter            # القرص الدائم يتطلب خطة مدفوعة
+    buildCommand: echo "no build"
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22.13.0
+      - key: DB_PATH
+        value: /var/data/app.db
+      - key: PUBLIC_URL
+        sync: false          # https://اسم-خدمتك.onrender.com
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TZ_OFFSET_HOURS
+        value: "3"
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1

@@ -1,8 +1,12 @@
 {
-  "name": "social-inbox",
+  "name": "replyflow",
   "version": "1.0.0",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "express": "^4.19.2", "pg": "^8.12.0", "exceljs": "^4.4.0" }
+  "description": "منصة رد ذكي على التعليقات والرسائل مع إرسال التفاصيل على الخاص",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning test/smoke.js"
+  }
 }
