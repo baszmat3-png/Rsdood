@@ -100,6 +100,35 @@ CREATE TABLE IF NOT EXISTS submissions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_sub_form ON submissions(form_id, created_at);
+CREATE TABLE IF NOT EXISTS flows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  start TEXT NOT NULL DEFAULT '',
+  nodes TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS keywords (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  match TEXT NOT NULL DEFAULT 'contains',
+  words TEXT NOT NULL DEFAULT '',
+  reply TEXT NOT NULL DEFAULT '',
+  flow_id INTEGER,
+  node TEXT NOT NULL DEFAULT '',
+  hotword INTEGER NOT NULL DEFAULT 0,
+  channel TEXT NOT NULL DEFAULT 'any',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS flow_state (
+  channel TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0,
+  menu TEXT NOT NULL DEFAULT '[]',
+  menu_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (channel, user_id)
+);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
 

@@ -59,12 +59,24 @@ const au = new URL(c2.data.url);
 assert.equal(au.searchParams.get('client_id'), '123456');
 assert.equal(au.searchParams.get('redirect_uri'), 'https://example.com/auth/meta/callback');
 const okPage = await fetch(base + '/auth/meta/callback?code=abc&state=' + au.searchParams.get('state')).then((r) => r.text());
-assert.ok(okPage.includes('meta=2'), okPage);
+const tok = /meta_pick=([a-f0-9]+)/.exec(okPage)?.[1]; assert.ok(tok, okPage);
+const pend = (await api('GET', '/api/meta/pending?token=' + tok)).data;
+assert.equal(pend.channel, 'facebook'); assert.ok(pend.items.length >= 1 && pend.items.every((i) => i.channel === 'facebook'));
+assert.equal((await api('GET', '/api/accounts')).data.length, 0); // لا ربط قبل الاختيار
+const pk = await api('POST', '/api/meta/pick', { token: tok, keys: pend.items.map((i) => i.key) });
+assert.equal(pk.status, 200); assert.equal(pk.data.connected, 1); assert.equal(subs.length, 1);
+const c3 = await api('POST', '/api/meta/connect', { channel: 'instagram' });
+const st3 = new URL(c3.data.url).searchParams.get('state');
+const tok2 = /meta_pick=([a-f0-9]+)/.exec(await fetch(base + '/auth/meta/callback?code=abc&state=' + st3).then((r) => r.text()))[1];
+const pend2 = (await api('GET', '/api/meta/pending?token=' + tok2)).data;
+assert.ok(pend2.items.length === 1 && pend2.items[0].channel === 'instagram');
+await api('POST', '/api/meta/pick', { token: tok2, keys: pend2.items.map((i) => i.key) });
 const accs = (await api('GET', '/api/accounts')).data;
 assert.deepEqual(accs.map((a) => a.channel).sort(), ['facebook', 'instagram']);
-assert.ok(accs.every((a) => a.hasToken)); assert.equal(subs.length, 1);
+assert.ok(accs.every((a) => a.hasToken));
+assert.equal((await api('POST', '/api/meta/pick', { token: tok, keys: [] })).status, 404); // لا إعادة استخدام
 const replay = await fetch(base + '/auth/meta/callback?code=abc&state=' + au.searchParams.get('state')).then((r) => r.text());
-assert.ok(replay.includes('meta_error')); ok('الربط الكامل: صفحة + إنستغرام + اشتراك + منع إعادة الاستخدام');
+assert.ok(replay.includes('meta_error')); ok('الربط: تسجيل الدخول ثم اختيار الحسابات لكل قناة ومنع إعادة الاستخدام');
 await api('PUT', '/api/settings', { public_url: '' });
 
 // الإعدادات
@@ -144,6 +156,49 @@ const xb = Buffer.from(await xr.arrayBuffer());
 assert.equal(xr.status, 200); assert.equal(xb.subarray(0, 2).toString(), 'PK'); fs.writeFileSync(path.join(tmp, 'out.xlsx'), xb);
 ok('تصدير Excel');
 assert.equal((await api('POST', '/api/simulate', { kind: 'message', text: 'حجز', sim_user: 'zz', channel: 'facebook' })).data.dmReply.includes('ما اسمك'), true); ok('التجربة تبدأ النموذج');
+
+// المسارات والأزرار والكلمات المفتاحية والقوالب
+const tpls = (await api('GET', '/api/flow-templates')).data;
+assert.ok(tpls.length >= 5); ok('قوالب المسارات متاحة');
+const tf = await api('POST', '/api/flows/from-template', { template: 'booking' });
+assert.equal(tf.status, 201); const flowId = tf.data.id;
+const formsNow = (await api('GET', '/api/forms')).data;
+assert.ok(formsNow.some((f) => f.name === 'حجز موعد' && f.id > 1)); ok('اعتماد قالب ينشئ المسار والنموذج');
+assert.equal((await api('POST', '/api/flows', { name: 'x', nodes: { a: { type: 'message', text: 'hi', buttons: [{ title: 'b', kind: 'node', to: 'nope' }] } } })).status, 400); ok('رفض زر يشير إلى عقدة غير موجودة');
+assert.equal((await api('POST', '/api/keywords', { match: 'contains', words: 'قائمة, menu', flow_id: flowId })).status, 201);
+const sim = async (body) => (await api('POST', '/api/simulate', { kind: 'message', channel: 'facebook', sim_user: 'flowu', ...body })).data;
+let fr = await sim({ text: 'عندي سؤال، افتح القائمة' });
+assert.ok(fr.replies[0].buttons.length === 3 && fr.replies[0].buttons[0].payload.startsWith('fm:')); ok('الكلمة المفتاحية تشغّل المسار بأزرار');
+const svc = fr.replies[0].buttons.find((b) => b.title.includes('الخدمات'));
+fr = await sim({ text: svc.title, payload: svc.payload });
+assert.match(fr.replies[0].text, /الخدمات والأسعار/); ok('زر ينتقل إلى عقدة');
+const bk = fr.replies[0].buttons.find((b) => b.payload.startsWith('fm:'));
+fr = await sim({ text: bk.title, payload: bk.payload });
+assert.match(fr.dmReply, /ما اسمك الكامل/); ok('زر يبدأ نموذج الحجز');
+// كلمة ساخنة تقطع النموذج
+await api('POST', '/api/keywords', { match: 'is', words: 'ايقاف', reply: 'تم الإيقاف', hotword: true });
+fr = await sim({ text: 'إيقاف' });
+assert.equal(fr.dmReply, 'تم الإيقاف'); ok('الكلمة الساخنة لها الأولوية');
+// عقدة تحويل لموظف تُوقف البوت حتى كلمة الاستئناف
+const hf = await api('POST', '/api/flows', { name: 'موظف', start: 'h', nodes: { h: { type: 'handoff', text: 'سيرد عليك موظف' } } });
+await api('POST', '/api/keywords', { match: 'is', words: 'موظف الان', flow_id: hf.data.id });
+await api('POST', '/api/keywords', { match: 'resume', words: 'ابدأ', reply: 'عدنا' });
+fr = await sim({ text: 'موظف الان', sim_user: 'pz' }); assert.equal(fr.paused, true);
+fr = await sim({ text: 'مرحبا', sim_user: 'pz' }); assert.equal(fr.status, 'skipped'); ok('عقدة التحويل توقف البوت');
+fr = await sim({ text: 'ابدأ', sim_user: 'pz' }); assert.equal(fr.dmReply, 'عدنا'); ok('كلمة الاستئناف');
+// إجابة برقم عندما لا تدعم القناة الأزرار
+const fl = await import('../src/flows.js');
+const NU = { channel: 'tiktok', userId: 'n1', userName: 'x' };
+fl.saveMenu(NU, [{ title: 'أ', payload: `f:${flowId}:services` }, { title: 'ب', payload: `f:${flowId}:address` }]);
+const nr = fl.flowKeywords({ ...NU, text: '٢', type: 'text' });
+assert.match(nr.msgs[0].text, /العنوان/); ok('الإجابة برقم الخيار');
+assert.match(fl.numberedText({ text: 'اختر', buttons: [{ title: 'أ', payload: 'x' }, { title: 'رابط', url: 'https://a.b' }] }), /1- أ[\s\S]*رابط: https:\/\/a\.b/);
+// تحويل أحداث ميتا: الأزرار والأنواع
+const { parseMeta } = await import('../src/channels/meta.js');
+const pm = parseMeta({ object: 'page', entry: [{ id: 'P', messaging: [{ sender: { id: 'u' }, postback: { title: 'خدمات', payload: 'f:1:services' } }, { sender: { id: 'u' }, message: { text: 'خدمات', quick_reply: { payload: 'f:1:prices' } } }, { sender: { id: 'u' }, message: { sticker_id: 5 } }] }] });
+assert.deepEqual(pm.map((e) => [e.payload, e.type]), [['f:1:services', 'text'], ['f:1:prices', 'text'], ['', 'sticker']]);
+const wm = parseMeta({ object: 'whatsapp_business_account', entry: [{ changes: [{ value: { metadata: { phone_number_id: 'W' }, messages: [{ from: '9647', type: 'interactive', interactive: { button_reply: { id: 'f:1:x', title: 'زر' } } }, { from: '9647', type: 'image' }] } }] }] });
+assert.deepEqual(wm.map((e) => [e.payload || '', e.type]), [['f:1:x', 'text'], ['', 'image']]); ok('تحليل أزرار ماسنجر وإنستغرام وواتساب والأنواع');
 
 console.log('\nنجحت كل الاختبارات');
 server.close();

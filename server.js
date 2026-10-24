@@ -7,11 +7,13 @@ import { all, get, run, getSetting, setSetting } from './src/db.js';
 import { processComment, processMessage } from './src/engine.js';
 import { aiConfigured } from './src/ai.js';
 import { parseMeta, verifySignature, oauthUrl, pagesFromCode, subscribePage } from './src/channels/meta.js';
-import { parseTelegram, setWebhook } from './src/channels/telegram.js';
+import { parseTelegram, setWebhook, answerCallback } from './src/channels/telegram.js';
 import { parseTikTok } from './src/channels/tiktok.js';
 import { CHANNELS } from './src/channels/index.js';
 import { parseForm, cleanForm, headerOf } from './src/forms.js';
 import { buildXlsx } from './src/xlsx.js';
+import { parseFlow, cleanFlow, MATCH_TYPES } from './src/flows.js';
+import { TEMPLATES } from './src/flow-templates.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -107,7 +109,7 @@ const baseUrl = () => (process.env.PUBLIC_URL || getSetting('public_url') || `ht
 const SECRET_KEYS = ['ai_key', 'app_secret'];
 const SETTING_KEYS = [
   'business_name', 'business_about', 'business_details', 'tone', 'handoff_words', 'handoff_reply', 'fallback_reply',
-  'ai_provider', 'ai_model', 'ai_base', 'delay_min', 'delay_max', 'hourly_cap', 'public_url', 'fb_app_id', ...SECRET_KEYS,
+  'ai_provider', 'ai_model', 'ai_base', 'delay_min', 'delay_max', 'hourly_cap', 'public_url', 'fb_app_id', 'default_flow_id', ...SECRET_KEYS,
 ];
 const DEFAULTS = {
   tone: 'ودّي ومهني', ai_provider: 'anthropic', ai_model: 'claude-sonnet-5-5', delay_min: '3', delay_max: '12', hourly_cap: '200',
@@ -164,6 +166,7 @@ function dispatch(ev, account) {
 /* ---------- الربط بحساب فيسبوك (OAuth) ---------- */
 
 const oauthStates = new Map();
+const pendingPicks = new Map(); // token -> {exp, channel, pages}
 const metaApp = () => ({ appId: process.env.FB_APP_ID || getSetting('fb_app_id'), appSecret: process.env.APP_SECRET || getSetting('app_secret') });
 const metaRedirect = () => `${baseUrl()}/auth/meta/callback`;
 function upsertAccount(channel, name, externalId, token) {
@@ -176,7 +179,8 @@ function upsertAccount(channel, name, externalId, token) {
 const bounce = (res, query) => send(res, 200, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/?${query}#/accounts"><title>…</title><body style="font-family:sans-serif;text-align:center;padding:48px">جارٍ العودة إلى المنصة…</body>`, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
 async function handleMetaCallback(res, url) {
   const state = url.searchParams.get('state') || '';
-  const exp = oauthStates.get(state);
+  const st = oauthStates.get(state);
+  const exp = st?.exp;
   oauthStates.delete(state);
   if (!exp || exp < Date.now()) return bounce(res, 'meta_error=' + encodeURIComponent('انتهت صلاحية الطلب، أعد المحاولة'));
   const code = url.searchParams.get('code');
@@ -185,15 +189,10 @@ async function handleMetaCallback(res, url) {
     const { appId, appSecret } = metaApp();
     const pages = await pagesFromCode({ appId, appSecret, redirect: metaRedirect(), code });
     if (!pages.length) return bounce(res, 'meta_error=' + encodeURIComponent('لم تُمنح صلاحية أي صفحة. أعد الربط واختر صفحتك'));
-    let n = 0, failed = 0;
-    for (const p of pages) {
-      const sub = await subscribePage(p);
-      if (!sub.ok) { failed += 1; console.error('[meta] subscribe', p.id, sub.error); continue; }
-      upsertAccount('facebook', p.name, p.id, p.token); n += 1;
-      if (p.ig) { upsertAccount('instagram', '@' + (p.ig.username || p.name), p.ig.id, p.token); n += 1; }
-    }
-    if (!n) return bounce(res, 'meta_error=' + encodeURIComponent('تعذّر تفعيل الاستقبال على الصفحة. تأكد من صلاحية pages_manage_metadata'));
-    return bounce(res, `meta=${n}` + (failed ? `&meta_failed=${failed}` : ''));
+    for (const [k, v] of pendingPicks) if (v.exp < Date.now()) pendingPicks.delete(k);
+    const token = crypto.randomBytes(24).toString('hex');
+    pendingPicks.set(token, { exp: Date.now() + 15 * 60_000, channel: st.channel || 'facebook', pages });
+    return bounce(res, 'meta_pick=' + token);
   } catch (e) {
     console.error('[meta]', e.message);
     return bounce(res, 'meta_error=' + encodeURIComponent(e.message));
@@ -234,7 +233,10 @@ async function handleWebhooks(req, res, url) {
     send(res, 200, 'ok');
     if (!body) return;
     const events = m[1] === 'telegram' ? parseTelegram(body) : parseTikTok(body);
-    for (const ev of events) dispatch(ev, account);
+    for (const ev of events) {
+      if (ev.cbId && account.token) answerCallback(account.token, ev.cbId).catch(() => {});
+      dispatch(ev, account);
+    }
     return;
   }
   return send(res, 404, 'not found');
@@ -284,10 +286,40 @@ async function handleApi(req, res, url) {
     const { appId, appSecret } = metaApp();
     if (!appId || !appSecret) return json(res, 400, { error: 'أدخل App ID و App Secret أولاً' });
     if (!baseUrl().startsWith('https://')) return json(res, 400, { error: 'يلزم عنوان HTTPS عام (PUBLIC_URL) لتسجيل الدخول بفيسبوك' });
-    for (const [k, v] of oauthStates) if (v < Date.now()) oauthStates.delete(k);
+    for (const [k, v] of oauthStates) if (v.exp < Date.now()) oauthStates.delete(k);
     const state = crypto.randomBytes(24).toString('hex');
-    oauthStates.set(state, Date.now() + 10 * 60_000);
+    const ch = ['facebook', 'instagram', 'whatsapp'].includes(body?.channel) ? body.channel : 'facebook';
+    oauthStates.set(state, { exp: Date.now() + 10 * 60_000, channel: ch });
     return json(res, 200, { url: oauthUrl(appId, metaRedirect(), state) });
+  }
+
+  if (p === '/api/meta/pending' && method === 'GET') {
+    const pk = pendingPicks.get(url.searchParams.get('token') || '');
+    if (!pk || pk.exp < Date.now()) return json(res, 404, { error: 'انتهت صلاحية الجلسة، أعد المحاولة' });
+    const linked = new Set(all('SELECT channel, external_id FROM accounts').map((a) => `${a.channel}:${a.external_id}`));
+    const items = [];
+    for (const g of pk.pages) {
+      if (pk.channel !== 'instagram') items.push({ key: `facebook:${g.id}`, channel: 'facebook', name: g.name, id: g.id, linked: linked.has(`facebook:${g.id}`) });
+      if (pk.channel !== 'whatsapp' && g.ig && pk.channel !== 'facebook') items.push({ key: `instagram:${g.ig.id}`, channel: 'instagram', name: '@' + (g.ig.username || g.name), id: g.ig.id, linked: linked.has(`instagram:${g.ig.id}`) });
+    }
+    return json(res, 200, { channel: pk.channel, items });
+  }
+  if (p === '/api/meta/pick' && method === 'POST') {
+    const pk = pendingPicks.get(body?.token || '');
+    if (!pk || pk.exp < Date.now()) return json(res, 404, { error: 'انتهت صلاحية الجلسة، أعد المحاولة' });
+    const want = new Set(Array.isArray(body.keys) ? body.keys : []);
+    let n = 0, failed = 0;
+    for (const g of pk.pages) {
+      const wantFb = want.has(`facebook:${g.id}`), wantIg = g.ig && want.has(`instagram:${g.ig.id}`);
+      if (!wantFb && !wantIg) continue;
+      const sub = await subscribePage(g);
+      if (!sub.ok) { failed += 1; console.error('[meta] subscribe', g.id, sub.error); continue; }
+      if (wantFb) { upsertAccount('facebook', g.name, g.id, g.token); n += 1; }
+      if (wantIg) { upsertAccount('instagram', '@' + (g.ig.username || g.name), g.ig.id, g.token); n += 1; }
+    }
+    pendingPicks.delete(body.token);
+    if (!n && failed) return json(res, 400, { error: 'تعذّر تفعيل الاستقبال. تأكد من صلاحية pages_manage_metadata' });
+    return json(res, 200, { ok: true, connected: n, failed });
   }
 
   if (p === '/api/overview' && method === 'GET') {
@@ -506,12 +538,83 @@ async function handleApi(req, res, url) {
     }
   }
 
+  /* المسارات والكلمات المفتاحية والقوالب */
+  if (p === '/api/flow-templates' && method === 'GET') return json(res, 200, TEMPLATES.map((t) => ({ id: t.id, name: t.name, desc: t.desc, nodes: Object.keys(t.flow.nodes).length, forms: Object.keys(t.forms).length })));
+  if (p === '/api/flows/from-template' && method === 'POST') {
+    const t = TEMPLATES.find((x) => x.id === body.template);
+    if (!t) return json(res, 404, { error: 'القالب غير موجود' });
+    const formIds = {};
+    for (const [k, f] of Object.entries(t.forms)) {
+      const c = cleanForm(f);
+      formIds[k] = run('INSERT INTO forms(name,kind,triggers,intro,fields,done_text,active,created_at) VALUES(?,?,?,?,?,?,?,?)', c.value.name, c.value.kind, c.value.triggers, c.value.intro, c.value.fields, c.value.done_text, 1, Date.now()).lastInsertRowid;
+    }
+    const nodes = JSON.parse(JSON.stringify(t.flow.nodes).replace(/"@(\w+)"/g, (m, k) => `"${formIds[k] ?? ''}"`));
+    for (const n of Object.values(nodes)) if (n.type === 'form' && n.form) n.form = Number(n.form);
+    const c = cleanFlow({ name: t.flow.name, start: t.flow.start, nodes });
+    if (c.error) return json(res, 500, { error: c.error });
+    const r = run('INSERT INTO flows(name,start,nodes,active,created_at) VALUES(?,?,?,?,?)', c.value.name, c.value.start, c.value.nodes, 1, Date.now());
+    return json(res, 201, parseFlow(get('SELECT * FROM flows WHERE id = ?', r.lastInsertRowid)));
+  }
+  if (p === '/api/flows' && method === 'GET') return json(res, 200, all('SELECT * FROM flows ORDER BY id DESC').map(parseFlow));
+  if (p === '/api/flows' && method === 'POST') {
+    const c = cleanFlow(body);
+    if (c.error) return json(res, 400, { error: c.error });
+    const r = run('INSERT INTO flows(name,start,nodes,active,created_at) VALUES(?,?,?,?,?)', c.value.name, c.value.start, c.value.nodes, c.value.active, Date.now());
+    return json(res, 201, parseFlow(get('SELECT * FROM flows WHERE id = ?', r.lastInsertRowid)));
+  }
+  let xm = p.match(/^\/api\/flows\/(\d+)$/);
+  if (xm) {
+    const fid = Number(xm[1]);
+    const cur = get('SELECT * FROM flows WHERE id = ?', fid);
+    if (!cur) return json(res, 404, { error: 'المسار غير موجود' });
+    if (method === 'DELETE') { run('DELETE FROM flows WHERE id = ?', fid); run('UPDATE keywords SET flow_id = NULL WHERE flow_id = ?', fid); if (getSetting('default_flow_id') == fid) setSetting('default_flow_id', ''); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      if (Object.keys(body).length === 1 && body.active !== undefined) { run('UPDATE flows SET active = ? WHERE id = ?', body.active ? 1 : 0, fid); return json(res, 200, { ok: true }); }
+      const c = cleanFlow({ ...parseFlow(cur), ...body });
+      if (c.error) return json(res, 400, { error: c.error });
+      run('UPDATE flows SET name=?, start=?, nodes=?, active=? WHERE id=?', c.value.name, c.value.start, c.value.nodes, c.value.active, fid);
+      return json(res, 200, parseFlow(get('SELECT * FROM flows WHERE id = ?', fid)));
+    }
+  }
+  const cleanKw = (b) => {
+    const match = MATCH_TYPES.includes(b.match) ? b.match : 'contains';
+    const words = String(b.words || '').slice(0, 1000);
+    if (!['image', 'sticker', 'audio'].includes(match) && !words.trim()) return { error: 'أضف كلمة مفتاحية واحدة على الأقل' };
+    const reply = String(b.reply || '').slice(0, 1900);
+    const flowId = b.flow_id ? Number(b.flow_id) : null;
+    if (flowId && !get('SELECT 1 x FROM flows WHERE id = ?', flowId)) return { error: 'المسار المحدد غير موجود' };
+    if (!reply.trim() && !flowId && match !== 'resume') return { error: 'اكتب رداً أو اختر مساراً' };
+    return { value: [String(b.name || '').slice(0, 100), match, words, reply, flowId, String(b.node || '').slice(0, 30), b.hotword ? 1 : 0, ['any', 'facebook', 'instagram', 'whatsapp', 'telegram', 'tiktok'].includes(b.channel) ? b.channel : 'any', b.active === false ? 0 : 1] };
+  };
+  if (p === '/api/keywords' && method === 'GET') return json(res, 200, all('SELECT * FROM keywords ORDER BY id DESC').map((k) => ({ ...k, active: !!k.active, hotword: !!k.hotword })));
+  if (p === '/api/keywords' && method === 'POST') {
+    const c = cleanKw(body);
+    if (c.error) return json(res, 400, { error: c.error });
+    const r = run('INSERT INTO keywords(name,match,words,reply,flow_id,node,hotword,channel,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', ...c.value, Date.now());
+    return json(res, 201, { id: r.lastInsertRowid });
+  }
+  xm = p.match(/^\/api\/keywords\/(\d+)$/);
+  if (xm) {
+    const kid = Number(xm[1]);
+    const cur = get('SELECT * FROM keywords WHERE id = ?', kid);
+    if (!cur) return json(res, 404, { error: 'غير موجود' });
+    if (method === 'DELETE') { run('DELETE FROM keywords WHERE id = ?', kid); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') {
+      if (Object.keys(body).length === 1 && body.active !== undefined) { run('UPDATE keywords SET active = ? WHERE id = ?', body.active ? 1 : 0, kid); return json(res, 200, { ok: true }); }
+      const c = cleanKw({ ...cur, ...body });
+      if (c.error) return json(res, 400, { error: c.error });
+      run('UPDATE keywords SET name=?, match=?, words=?, reply=?, flow_id=?, node=?, hotword=?, channel=?, active=? WHERE id=?', ...c.value, kid);
+      return json(res, 200, { ok: true });
+    }
+  }
+
   if (p === '/api/simulate' && method === 'POST') {
     const text = String(body.text || '').trim();
-    if (!text) return json(res, 400, { error: 'اكتب نص التعليق أو الرسالة' });
+    if (!text && !body.payload && !['image', 'sticker', 'audio'].includes(body.type)) return json(res, 400, { error: 'اكتب نص التعليق أو الرسالة' });
     const ev = {
       channel: CHANNELS[body.channel] ? body.channel : 'facebook', postId: String(body.post_id || '').trim(), commentId: '',
       userId: body.sim_user ? `sim-${String(body.sim_user).replace(/[^\w-]/g, '').slice(0, 24)}` : `sim-${crypto.randomBytes(4).toString('hex')}`, userName: String(body.user_name || 'أحمد').trim(), text, account: null,
+      payload: String(body.payload || ''), type: ['image', 'sticker', 'audio'].includes(body.type) ? body.type : 'text',
     };
     const result = body.kind === 'message' ? await processMessage(ev, { simulate: true }) : await processComment(ev, { simulate: true });
     return json(res, 200, { ...result, aiConfigured: aiConfigured() });

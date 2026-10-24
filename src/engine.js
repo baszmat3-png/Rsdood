@@ -1,7 +1,8 @@
 import { all, get, run, getSetting } from './db.js';
 import { complete, baseSystem, aiConfigured } from './ai.js';
 import { adapters } from './channels/index.js';
-import { handleFormTurn, clearFormSession } from './forms.js';
+import { handleFormTurn, clearFormSession, hasFormSession } from './forms.js';
+import { flowPrelude, flowKeywords, flowDefault, isPaused, resumeBot, setPaused, saveMenu, numberedText } from './flows.js';
 
 /* ---------- أدوات النصوص ---------- */
 
@@ -221,9 +222,27 @@ function remember(channel, userId, role, text) {
   run('INSERT INTO messages(channel, user_id, role, text, ts) VALUES(?,?,?,?,?)', channel, String(userId), role, clip(text, 2000), Date.now());
 }
 
+/** يرسل رسالة واحدة (نص أو نص بأزرار/صورة). القنوات بلا أزرار تُرسل قائمة مرقّمة. */
+async function deliverMsg(ev, m, simulate) {
+  const hasUi = (m.buttons && m.buttons.length) || m.image;
+  if (!hasUi) return deliver('sendMessage', ev, m.text, simulate);
+  const adapter = adapters[ev.channel];
+  if (adapter?.sendMenu) {
+    if (simulate) return { status: 'simulated' };
+    if (!ev.account?.token) return { status: 'simulated' };
+    try {
+      const r = await adapter.sendMenu(ev.account, ev, m);
+      return r.ok ? { status: 'sent' } : { status: 'failed', error: String(r.error || 'خطأ غير معروف') };
+    } catch (e) { return { status: 'failed', error: e.message }; }
+  }
+  if (!simulate) saveMenu(ev, m.buttons);
+  return deliver('sendMessage', ev, numberedText(m), simulate);
+}
+
 export async function processMessage(ev, opts = {}) {
   const simulate = !!opts.simulate;
-  ev = { ...ev, kind: 'message', commentId: '' };
+  ev = { ...ev, kind: 'message', commentId: '', type: ev.type || 'text' };
+  if (!ev.text && ev.type !== 'text') ev.text = `[${ev.type}]`;
   const id = insertEvent(ev, { simulated: simulate });
 
   // حماية من الحلقات والإغراق: حد أقصى للردود الآلية لكل شخص في الساعة
@@ -240,26 +259,56 @@ export async function processMessage(ev, opts = {}) {
     return { id, status: 'skipped' };
   }
 
-  const handoffWords = splitKeywords(getSetting('handoff_words', 'موظف, شخص حقيقي, مدير, شكوى, اتصل بي'));
-  const t = ` ${norm(ev.text)} `;
-  const wantsHuman = handoffWords.some((w) => t.includes(w));
-
-  let reply;
+  let msgs = null;
   let status = 'done';
-  let formTurn = null;
-  if (wantsHuman) {
-    clearFormSession(ev);
-    reply = getSetting('handoff_reply', 'تم تحويل رسالتك إلى فريقنا وسيتواصل معك أحد المختصين في أقرب وقت 🌷');
-    status = 'handoff';
-  } else if ((formTurn = handleFormTurn(ev, simulate))) {
-    reply = clip(formTurn.reply, 1900);
+  let pause = false;
+  const take = (r) => { if (r) { msgs = r.msgs; pause = !!r.pause; } return !!r; };
+
+  if (isPaused(ev)) {
+    const r = resumeBot(ev);
+    const p = r ? null : (ev.payload ? flowPrelude(ev) : null);
+    if (!r && !p) {
+      updateEvent(id, { status: 'skipped', error: 'البوت متوقف لهذا الشخص بانتظار موظف (يُستأنف بكلمة الاستئناف أو بعد 12 ساعة)' });
+      return { id, status: 'skipped' };
+    }
+    if (p) setPaused(ev, false);
+    take(r || p);
   } else {
+    take(flowPrelude(ev));
+  }
+
+  const nonText = ev.type !== 'text';
+  const handoffWords = splitKeywords(getSetting('handoff_words', 'موظف, شخص حقيقي, مدير, شكوى, اتصل بي'));
+  const wantsHuman = !nonText && handoffWords.some((w) => ` ${norm(ev.text)} `.includes(w));
+  // 1) جواب سؤال داخل نموذج جارٍ  2) الكلمات المفتاحية  3) طلب موظف  4) بدء نموذج
+  if (!msgs && !nonText && !wantsHuman && hasFormSession(ev)) {
+    const ft = handleFormTurn(ev, simulate);
+    if (ft) msgs = [{ text: clip(ft.reply, 1900) }];
+  }
+  if (!msgs) take(flowKeywords(ev));
+  if (!msgs && !nonText) {
+    if (wantsHuman) {
+      clearFormSession(ev);
+      msgs = [{ text: getSetting('handoff_reply', 'تم تحويل رسالتك إلى فريقنا وسيتواصل معك أحد المختصين في أقرب وقت 🌷') }];
+      status = 'handoff';
+    } else {
+      const ft = handleFormTurn(ev, simulate);
+      if (ft) msgs = [{ text: clip(ft.reply, 1900) }];
+    }
+  }
+  if (!msgs && nonText) {
+    updateEvent(id, { status: 'no_match' });
+    return { id, status: 'no_match' };
+  }
+  if (!msgs) take(flowDefault(ev));
+
+  if (!msgs) {
     const past = history(ev.channel, ev.userId);
-    const msgs = [...past.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text }))];
+    const hist = [...past.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text }))];
     // يجب أن تبدأ المحادثة برسالة من العميل وتتناوب الأدوار
-    while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+    while (hist.length && hist[0].role !== 'user') hist.shift();
     const merged = [];
-    for (const m of msgs) {
+    for (const m of hist) {
       const last = merged[merged.length - 1];
       if (last && last.role === m.role) last.content += `\n${m.text}`;
       else merged.push({ role: m.role, content: m.text });
@@ -270,7 +319,7 @@ export async function processMessage(ev, opts = {}) {
     else merged.push({ role: 'user', content: current });
     for (const m of merged) if (m.role === 'user' && !m.content.includes('<customer>')) m.content = `<customer>${m.content}</customer>`;
 
-    reply = await complete({
+    let reply = await complete({
       system: `${baseSystem()}\n\nالمهمة: أجب عن رسالة خاصة من عميل. إن طلب أمراً لا تملك معلوماته فأخبره أن الفريق سيتواصل معه.`,
       messages: merged,
       maxTokens: 450,
@@ -280,20 +329,24 @@ export async function processMessage(ev, opts = {}) {
         ? 'شكراً لتواصلك، وصلتنا رسالتك وسنرد عليك قريباً 🌷'
         : getSetting('fallback_reply', 'أهلاً بك! وصلتنا رسالتك وسيرد عليك فريقنا قريباً 🌷');
     }
-    reply = clip(reply, 1900);
+    msgs = [{ text: clip(reply, 1900) }];
   }
 
-  if (!simulate) {
-    remember(ev.channel, ev.userId, 'user', ev.text);
-  }
+  const plain = msgs.map((m) => m.text).filter(Boolean).join('\n\n');
+  if (!simulate) remember(ev.channel, ev.userId, 'user', ev.text);
   await humanDelay(simulate);
-  const sent = await deliver('sendMessage', ev, reply, simulate);
-  if (!simulate && sent.status !== 'failed') remember(ev.channel, ev.userId, 'assistant', reply);
+  let sentStatus = '';
+  let error = '';
+  for (let i = 0; i < msgs.length; i++) {
+    const r = await deliverMsg(ev, msgs[i], simulate);
+    if (r.status === 'failed') { sentStatus = 'failed'; error = r.error || ''; break; }
+    if (sentStatus !== 'sent') sentStatus = r.status;
+    if (i < msgs.length - 1 && !simulate) await sleep(600);
+  }
+  if (pause && sentStatus !== 'failed') setPaused(ev, true);
+  if (!simulate && sentStatus !== 'failed') remember(ev.channel, ev.userId, 'assistant', plain);
 
-  updateEvent(id, {
-    dm_reply: reply, dm_status: sent.status,
-    status: sent.status === 'failed' ? 'failed' : status,
-    error: sent.error || '',
-  });
-  return { id, status: sent.status === 'failed' ? 'failed' : status, dmReply: reply, dmStatus: sent.status, error: sent.error || '' };
+  const finalStatus = sentStatus === 'failed' ? 'failed' : status;
+  updateEvent(id, { dm_reply: plain, dm_status: sentStatus, status: finalStatus, error });
+  return { id, status: finalStatus, dmReply: plain, replies: msgs, paused: pause, dmStatus: sentStatus, error };
 }

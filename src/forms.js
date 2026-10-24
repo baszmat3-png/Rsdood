@@ -97,18 +97,25 @@ function findSession(ev) {
   if (s.updated_at < Date.now() - SESSION_MS) { clearFormSession(ev); return null; }
   return s;
 }
+export const hasFormSession = (ev) => !!findSession(ev);
 export function clearFormSession(ev) {
   run('DELETE FROM form_sessions WHERE channel = ? AND user_id = ?', ev.channel, String(ev.userId));
+}
+
+/** يبدأ نموذجاً محدداً (من زر في مسار مثلاً). */
+export function startFormById(ev, id) {
+  const form = parseForm(get('SELECT * FROM forms WHERE id = ? AND active = 1', Number(id)));
+  if (!form || !form.fields.length) return null;
+  run('INSERT OR REPLACE INTO form_sessions(channel,user_id,form_id,step,answers,updated_at) VALUES(?,?,?,?,?,?)',
+    ev.channel, String(ev.userId), form.id, 0, '{}', Date.now());
+  return { reply: `${fillText(form.intro || DEFAULT_INTRO, { name: ev.userName })}\n\n${question(form, 0)}` };
 }
 
 function matchForm(ev) {
   const t = ` ${norm(ev.text)} `;
   for (const row of all('SELECT * FROM forms WHERE active = 1 ORDER BY id')) {
     const words = splitKeywords(row.triggers);
-    if (words.some((w) => t.includes(` ${w} `) || t.includes(w))) {
-      const f = parseForm(row);
-      if (f.fields.length) return f;
-    }
+    if (words.some((w) => t.includes(w))) return row.id;
   }
   return null;
 }
@@ -117,11 +124,9 @@ function matchForm(ev) {
 export function handleFormTurn(ev, simulate = false) {
   const sess = findSession(ev);
   if (!sess) {
-    const form = matchForm(ev);
-    if (!form) return null;
-    run('INSERT OR REPLACE INTO form_sessions(channel,user_id,form_id,step,answers,updated_at) VALUES(?,?,?,?,?,?)',
-      ev.channel, String(ev.userId), form.id, 0, '{}', Date.now());
-    return { reply: `${fillText(form.intro || DEFAULT_INTRO, { name: ev.userName })}\n\n${question(form, 0)}` };
+    if (ev.type && ev.type !== 'text') return null;
+    const fid = matchForm(ev);
+    return fid ? startFormById(ev, fid) : null;
   }
   const form = parseForm(get('SELECT * FROM forms WHERE id = ?', sess.form_id));
   if (!form || !form.active) { clearFormSession(ev); return null; }
