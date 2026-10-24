@@ -291,7 +291,7 @@ async function handleApi(req, res, url) {
     const state = crypto.randomBytes(24).toString('hex');
     const ch = ['facebook', 'instagram', 'whatsapp'].includes(body?.channel) ? body.channel : 'facebook';
     oauthStates.set(state, { exp: Date.now() + 10 * 60_000, channel: ch });
-    return json(res, 200, { url: oauthUrl(appId, metaRedirect(), state) });
+    return json(res, 200, { url: oauthUrl(appId, metaRedirect(), state, ch) });
   }
 
   if (p === '/api/meta/pending' && method === 'GET') {

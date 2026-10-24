@@ -24,13 +24,16 @@ async function gget(path, params, token) {
   return j;
 }
 
-const SCOPES = ['pages_show_list', 'pages_messaging', 'pages_manage_metadata', 'pages_manage_engagement', 'pages_read_engagement',
-  'instagram_basic', 'instagram_manage_comments', 'instagram_manage_messages'];
+const PAGE_SCOPES = ['pages_show_list', 'pages_messaging', 'pages_manage_metadata', 'pages_manage_engagement', 'pages_read_engagement'];
+const IG_SCOPES = ['instagram_basic', 'instagram_manage_comments', 'instagram_manage_messages'];
+/** الصلاحيات المطلوبة: لفيسبوك صلاحيات الصفحات فقط، ولإنستغرام تُضاف صلاحياته. يمكن تجاوزها بالمتغير OAUTH_SCOPES. */
+export const scopesFor = (channel) => (process.env.OAUTH_SCOPES ? process.env.OAUTH_SCOPES.split(',').map((x) => x.trim()).filter(Boolean)
+  : channel === 'instagram' ? [...PAGE_SCOPES, ...IG_SCOPES] : PAGE_SCOPES);
 
 /** رابط تسجيل الدخول بفيسبوك (OAuth). */
-export function oauthUrl(appId, redirect, state) {
+export function oauthUrl(appId, redirect, state, channel = 'facebook') {
   const u = new URL(`https://www.facebook.com/${VERSION}/dialog/oauth`);
-  u.search = new URLSearchParams({ client_id: appId, redirect_uri: redirect, state, response_type: 'code', scope: SCOPES.join(',') }).toString();
+  u.search = new URLSearchParams({ client_id: appId, redirect_uri: redirect, state, response_type: 'code', scope: scopesFor(channel).join(',') }).toString();
   return u.toString();
 }
 
