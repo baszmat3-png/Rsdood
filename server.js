@@ -22,7 +22,8 @@ const TZ = Number(process.env.TZ_OFFSET_HOURS ?? 3) * 3600_000;
 
 /* ---------- تهيئة أولية ---------- */
 
-if (!getSetting('verify_token')) setSetting('verify_token', crypto.randomBytes(16).toString('hex'));
+if (process.env.VERIFY_TOKEN) setSetting('verify_token', process.env.VERIFY_TOKEN);
+else if (!getSetting('verify_token')) setSetting('verify_token', crypto.randomBytes(16).toString('hex'));
 
 function hashPassword(pw, salt = crypto.randomBytes(16).toString('hex')) {
   return `${salt}:${crypto.scryptSync(pw, salt, 32).toString('hex')}`;
